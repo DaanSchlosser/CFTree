@@ -46,7 +46,11 @@ CFTree/
 
 ### 1. Data Acquisition (`get_data`)
 - Input: `cases/<case_name>/case_area.geojson`
-- Downloads and clips AHN5 LiDAR tiles and digital terrain models (DTM) for the specified area.
+- Downloads and clips AHN LiDAR tiles and digital terrain models (DTM) for the specified area.
+- Defaults to **AHN6** (1x1 km Cloud-Optimized Point Cloud, served by `basisdata.nl`); pass
+  `--ahn-version 4` or `--ahn-version 5` to use the TU Delft GeoTiles host instead.
+- Note: the first AHN6 release covers only the northeast of the Netherlands. AHN6 outputs
+  must be attributed (CC BY 4.0); AHN4 and AHN5 are CC0.
 - Outputs stored under `data/<case_name>/tiles/<tile_id>/`.
 
 ### 2. Tree Segmentation (`segmentation`)
@@ -162,7 +166,7 @@ data/<case_name>/gtid_map.csv
 ## Performance
 | City      | # Trees | Runtime (16 cores) | Notes                       |
 | --------- | ------- | ------------------ | --------------------------- |
-| Amsterdam | ~380k   | ~13 h              | Full pipeline, AHN5 dataset |
+| Amsterdam | ~380k   | ~13 h              | Full pipeline, AHN4 dataset |
 | Rotterdam | ~210k   | ~7 h               |                             |
 | Utrecht   | ~150k   | ~5 h               |                             |
 | Delft     | ~90k    | ~3 h               |                             |
