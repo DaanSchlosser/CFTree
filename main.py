@@ -7,30 +7,9 @@ import subprocess
 import logging
 import time
 import argparse
-import geopandas as gpd
 from src.config import get_config, setup_logger
 import os
 import signal
-
-
-def query_tile_intersection(cfg, case, buffer=20.0):
-    """
-    Returns the list of intersecting tile IDs for a given case.
-    Replicates the logic from get_data.py.
-    """
-    aoi_path = cfg["case_root"] / case / "case_area.geojson"
-    tiles_path = cfg["resources_dir"] / "AHN_subunits_GeoTiles" / "AHN_subunits_GeoTiles.shp"
-
-    # Load AOI and buffer it
-    aoi = gpd.read_file(aoi_path).to_crs(cfg["crs"])
-    aoi["geometry"] = aoi.buffer(buffer)
-
-    # Load GeoTiles and find intersections
-    tiles = gpd.read_file(tiles_path).to_crs(cfg["crs"])
-    intersecting = tiles[tiles.intersects(aoi.union_all())]
-    tile_ids = intersecting["GT_AHNSUB"].unique().tolist()
-    return tile_ids
-
 
 
 def run_stage(name, cmd):
@@ -75,6 +54,13 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Only list tiles to be processed")
     parser.add_argument("--buffer", type=float, default=20.0, help="Buffer distance around AOI (default 20m)")
     parser.add_argument("--max-trees", type=int, default=None, help="Limit number of trees per tile (for testing)")
+    parser.add_argument(
+        "--ahn-version",
+        type=int,
+        choices=(4, 5, 6),
+        default=6,
+        help="AHN release to download (default: 6). 4/5 are TU Delft GeoTiles; 6 is basisdata.nl COPC.",
+    )
     args = parser.parse_args()
 
     # -------------------------------
@@ -89,20 +75,7 @@ def main():
     # Setup main logger
     # -------------------------------
     log_path = setup_logger(case, "main", level="INFO")
-    logger = logging.getLogger()  # <-- define logger
-
-    # -------------------------------
-    # Estimate tiles to process
-    # -------------------------------
-    try:
-        tile_ids = query_tile_intersection(cfg, case, buffer=args.buffer)
-        if tile_ids:
-            logger.info(f"Case '{case}' requires {len(tile_ids)} tiles: {tile_ids}")
-        else:
-            logger.warning(f"Case '{case}' — no intersecting tiles found.")
-    except Exception as e:
-        logger.warning(f"Could not determine tile intersection: {e}")
-        tile_ids = []
+    logger = logging.getLogger()
 
     # -------------------------------
     # Base command builder
@@ -117,7 +90,7 @@ def main():
     # -------------------------------
     # Stage command definitions
     # -------------------------------
-    cmd_get_data = f"python -m scripts.get_data {base_cmd} --buffer {args.buffer}"
+    cmd_get_data = f"python -m scripts.get_data {base_cmd} --buffer {args.buffer} --ahn-version {args.ahn_version}"
     cmd_segmentation = f"python -m scripts.segmentation {base_cmd}"
     cmd_reconstruction = f"python -m scripts.reconstruction {base_cmd}"
     if args.max_trees is not None:
@@ -128,17 +101,14 @@ def main():
     # -------------------------------
     logger.info("\n" + "=" * 60 + "Starting full CFTree pipeline")
     logger.info("=" * 20 + " Stage 1: Data Acquisition")
-    logger.info(f"buffer distance: {args.buffer} m")
-    logger.info(f'running...\t ETA = ~ {len(tile_ids) / n_cores * 2.0} minutes (assuming ~2.0 min per tile)')
+    logger.info(f"buffer distance: {args.buffer} m, AHN version: {args.ahn_version}")
     run_stage("get_data", cmd_get_data)
 
     logger.info("=" * 20 + " Stage 2: Segmentation")
-    logger.info(f'running...\t ETA = ~ {len(tile_ids) / n_cores * 0.0} minutes (assuming ~0.0 min per tile)')
     run_stage("segmentation", cmd_segmentation)
 
     logger.info("=" * 20 + " Stage 3: Reconstruction")
     logger.info(f"max trees per tile: {args.max_trees if args.max_trees is not None else 'unlimited'}")
-    logger.info(f'running...\t ETA = ~ {len(tile_ids) / n_cores * 0.0} minutes (assuming ~0.0 min per tile)')
     run_stage("reconstruction", cmd_reconstruction)
 
     total_time = (time.time() - start) / 60
