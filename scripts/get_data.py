@@ -9,35 +9,43 @@ scripts/run_get_data.py
 Full pipeline for downloading and clipping AHN geotiles for a case.
 
 Example:
-    nohup python -m scripts.run_get_data --n-cores 2 --case wippolder &
+    nohup python -m scripts.run_get_data --n-cores 2 --case emmer_compascuum &
 """
 
+import argparse
 import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import argparse
-import geopandas as gpd
 from pathlib import Path
 
+import geopandas as gpd
+
 from src.config import get_config, setup_logger
-from src.get_data.download_geotiles import download_tile
 from src.get_data.clip_tile import clip_tile
+from src.get_data.download_geotiles import download_tile
 from src.get_data.extract_dtm import compute_tile_dtm
+from src.get_data.tile_sources import TileSource, from_version
 
 
 # ---------------------------------------------------------------------
 # Tile worker (must be top-level for multiprocessing)
 # ---------------------------------------------------------------------
-def process_tile(tile_id: str, output_dir: Path, base_url: str, overwrite: bool, aoi_path: Path) -> dict:
+def process_tile(
+    tile_id: str,
+    output_dir: Path,
+    source: TileSource,
+    overwrite: bool,
+    aoi_path: Path,
+) -> dict:
     """Download, clip, and compute DTM for one tile."""
     try:
         # ---------------------------
         # 1. Download raw tile
         # ---------------------------
-        result_dl = download_tile(tile_id, output_dir, base_url, overwrite=overwrite)
+        result_dl = download_tile(tile_id, output_dir, source, overwrite=overwrite)
         laz_path = result_dl.get("paths", {}).get("laz")
 
         if result_dl["status"] != "ok" or not laz_path or not Path(laz_path).exists():
-            return {"tile_id": tile_id, "status": "download_failed"}
+            return {"tile_id": tile_id, "status": result_dl.get("status", "download_failed")}
 
         # ---------------------------
         # 2. Clip tile to AOI
@@ -96,6 +104,13 @@ def main():
     parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG, INFO, WARNING)")
     parser.add_argument("--dry-run", action="store_true", help="Only list tiles to be processed")
     parser.add_argument("--buffer", type=float, default=20.0, help="Buffer in meters around AOI")
+    parser.add_argument(
+        "--ahn-version",
+        type=int,
+        choices=(4, 5, 6),
+        default=6,
+        help="AHN release to download (default: 6). 4/5 are TU Delft GeoTiles; 6 is basisdata.nl COPC.",
+    )
     args = parser.parse_args()
 
     # Load configuration
@@ -108,10 +123,11 @@ def main():
     logging.info(f"Starting get_data for case: {case}")
     logging.info(f"Parallel workers: {n_cores} (from {'CLI' if args.n_cores else 'config'})")
     logging.info(f"Buffer distance: {args.buffer} m")
+    logging.info(f"AHN release: AHN{args.ahn_version}")
 
     aoi_path = cfg["case_path"] / "case_area.geojson"
     buffered_aoi_path = cfg["case_path"] / "case_area_buffered.geojson"
-    resources_dir = cfg["resources_dir"] 
+    resources_dir = cfg["resources_dir"]
     output_dir = cfg["data_case_path"]
 
     # ------------------------------------------------------------------
@@ -125,32 +141,34 @@ def main():
     logging.info(f"Buffered AOI saved to {buffered_aoi_path}")
 
     # ------------------------------------------------------------------
-    # Step 2: Determine intersecting tiles
+    # Step 2: Resolve tile catalog and intersecting tiles
     # ------------------------------------------------------------------
-    tiles = gpd.read_file(resources_dir / "AHN_subunits_GeoTiles" / "AHN_subunits_GeoTiles.shp").to_crs(cfg["crs"])
-    intersecting = tiles[tiles.intersects(aoi.union_all())]
-    tile_ids = intersecting["GT_AHNSUB"].unique().tolist()
+    source = from_version(args.ahn_version, resources_dir)
+    logging.info(f"Tile source: {source.name}, {source.attribution}")
+
+    tile_ids = source.tiles_for_aoi(aoi.union_all())
 
     if not tile_ids:
         logging.info("No intersecting tiles found.")
         return
 
-    logging.info(f"Found {len(tile_ids)} intersecting tiles: {tile_ids if len(tile_ids) <= 10 else '...'}")
+    logging.info(
+        f"Found {len(tile_ids)} intersecting tiles: "
+        f"{tile_ids if len(tile_ids) <= 10 else tile_ids[:10] + ['...']}"
+    )
 
     if args.dry_run:
         logging.info("[DRY RUN] Exiting before downloads.")
         return
 
     # ------------------------------------------------------------------
-    # Step 3: Per-tile pipeline (download → clip)
+    # Step 3: Per-tile pipeline (download → clip → DTM)
     # ------------------------------------------------------------------
-    base_url = "https://geotiles.citg.tudelft.nl/AHN5_T"
-
     if n_cores > 1:
         logging.info(f"Running {len(tile_ids)} tiles in parallel using {n_cores} cores.")
         with ProcessPoolExecutor(max_workers=n_cores) as pool:
             futures = {
-                pool.submit(process_tile, tid, output_dir, base_url, args.overwrite, buffered_aoi_path): tid
+                pool.submit(process_tile, tid, output_dir, source, args.overwrite, buffered_aoi_path): tid
                 for tid in tile_ids
             }
             for f in as_completed(futures):
@@ -163,7 +181,7 @@ def main():
     else:
         logging.info("Running serial mode.")
         for tid in tile_ids:
-            result = process_tile(tid, output_dir, base_url, args.overwrite, buffered_aoi_path)
+            result = process_tile(tid, output_dir, source, args.overwrite, buffered_aoi_path)
             logging.info(f"[{tid}] {result['status'].upper()}")
 
     logging.info(f"Completed get_data for case: {case}")
