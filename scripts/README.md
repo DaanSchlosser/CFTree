@@ -63,20 +63,34 @@ All scripts accept the following common flags to overwrite the default settings:
 
 ## 1. Data Acquisition — `get_data.py`
 
-Downloads and prepares AHN5 tiles for the selected case.  
+Downloads and prepares AHN tiles for the selected case.
 Performs download, clipping, and DTM generation.
 
 ### Main steps:
 1. Buffer the case polygon (`case_area.geojson`).
-2. Find intersecting AHN5 tiles.
-3. Download raw `.laz` files from [TU Delft GeoTiles server](https://geotiles.citg.tudelft.nl/AHN5_T).
+2. Resolve the AHN tile catalog (AHN6 by default; opt in to AHN4 or AHN5).
+3. Download raw `.laz` files (AHN6 Cloud-Optimized Point Clouds from
+   [basisdata.nl](https://basisdata.nl/hwh-ahn/AHN6/01_LAZ/), or AHN4/AHN5 sub-tiles
+   from the [TU Delft GeoTiles server](https://geotiles.citg.tudelft.nl/) via
+   `--ahn-version 4` / `--ahn-version 5`).
 4. Clip tiles to AOI and compute `clipped_dtm.tif`.
+
+### Tile sources
+
+| Version | Grid           | Endpoint                                                              | License     |
+|---------|----------------|-----------------------------------------------------------------------|-------------|
+| AHN6    | 1x1 km KM      | `basisdata.nl/hwh-ahn/AHN6/01_LAZ/AHN6_2025_C_<minX>_<minY>.COPC.LAZ` | CC BY 4.0   |
+| AHN5    | 1x1.25 km TOP  | `geotiles.citg.tudelft.nl/AHN5_T/<tile_id>.LAZ` (+ `.LAX`)            | CC0 1.0     |
+| AHN4    | 1x1.25 km TOP  | `geotiles.citg.tudelft.nl/AHN4_T/<tile_id>.LAZ` (+ `.LAX`)            | CC0 1.0     |
+
+The AHN6 first release covers only the northeast of the Netherlands. Outside that
+footprint each tile logs `not_found_remote`; fall back to AHN4 or AHN5 for those AOIs.
 
 ### Outputs:
 per tile:
 ``` bash
 raw.laz                 # raw ALS point cloud tile downloaded
-raw.lax                 # spatial index file
+raw.lax                 # spatial index file (AHN4/AHN5 only; AHN6 COPC has built-in indexing)
 clipped.laz             # point cloud clipped to case polygon
 clipped_dtm.tif         # DTM raster of clipped tile
 ```
@@ -86,10 +100,12 @@ clipped_dtm.tif         # DTM raster of clipped tile
 | Flag | Type | Description |
 |------|------|-------------|
 | `--buffer` | `float` | Buffer distance in meters around AOI (default 20m). |
+| `--ahn-version` | `int` | AHN release: `6` (default), `5`, or `4`. |
 
 ### Example:
 ```bash
-python -m scripts.get_data --case wippolder --n-cores 4 --buffer 10
+python -m scripts.get_data --case emmer_compascuum --n-cores 4 --buffer 10
+python -m scripts.get_data --case wippolder --n-cores 4 --ahn-version 5   # AHN6 not yet available here
 ```
 
 
