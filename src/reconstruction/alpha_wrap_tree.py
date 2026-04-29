@@ -24,10 +24,10 @@ Returns:
 """
 
 from __future__ import annotations
-import subprocess
+
 import logging
+import subprocess
 from pathlib import Path
-from typing import Optional
 
 
 def alpha_wrap_tree(
@@ -35,8 +35,8 @@ def alpha_wrap_tree(
     cache_dir: Path,
     ralpha: float = 15.0,
     roffset: float = 50.0,
-    binary_path: Optional[Path] = None,
-    overwrite: bool = False
+    binary_path: Path | None = None,
+    overwrite: bool = False,
 ) -> dict:
     """
     Run CGAL alpha wrapping on a single tree point cloud.
@@ -74,16 +74,10 @@ def alpha_wrap_tree(
         return {"gtid": gtid, "status": "skipped", "outputs": {"mesh_ply": mesh_ply}}
 
     # Run binary
-    cmd = [
-        str(binary_path),
-        str(tree_xyz),
-        str(ralpha),
-        str(roffset),
-        str(mesh_ply)
-    ]
+    cmd = [str(binary_path), str(tree_xyz), str(ralpha), str(roffset), str(mesh_ply)]
 
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(cmd, check=True, capture_output=True)
         logging.debug(f"[GTID {gtid}] Alpha wrap complete -> {mesh_ply.name}")
         return {"gtid": gtid, "status": "ok", "outputs": {"mesh_ply": mesh_ply}}
     except subprocess.CalledProcessError as e:

@@ -19,10 +19,11 @@ Structure per tree:
 """
 
 from __future__ import annotations
+
 import logging
-from pathlib import Path
+
 import numpy as np
-import trimesh
+
 
 # ---------------------------------------------------------------------
 # Initialization
@@ -40,7 +41,8 @@ def init_cityjson() -> dict:
     logging.info("[cityjson] Initialized new CityJSON structure")
     return city
 
-def format_crs_uri(crs_str: str) -> str:
+
+def format_crs_uri(crs_str: str | None) -> str | None:
     """
     Convert a CRS code like 'EPSG:28992' into a valid OGC CRS URI for CityJSON.
     Example: 'EPSG:28992' -> 'https://www.opengis.net/def/crs/EPSG/0/28992'
@@ -50,8 +52,9 @@ def format_crs_uri(crs_str: str) -> str:
     if crs_str.upper().startswith("EPSG:"):
         epsg_code = crs_str.split(":")[1]
         return f"https://www.opengis.net/def/crs/EPSG/0/{epsg_code}"
-    
+
     return crs_str
+
 
 # ---------------------------------------------------------------------
 # Geometry helpers
@@ -60,11 +63,8 @@ def _append_vertices(city: dict, verts_global: np.ndarray) -> tuple[list[list[fl
     vbase = len(city["vertices"])
     n = len(verts_global)
     city["vertices"].extend(verts_global.tolist())
-    logging.debug(
-        f"[cityjson] Appended {n} vertices (vbase={vbase}, range={vbase}–{vbase+n-1})"
-    )
+    logging.debug(f"[cityjson] Appended {n} vertices (vbase={vbase}, range={vbase}–{vbase + n - 1})")
     return verts_global.tolist(), vbase
-
 
 
 def _solid_from_faces(faces: np.ndarray, base_index: int) -> dict:
@@ -87,10 +87,7 @@ def _solid_from_faces(faces: np.ndarray, base_index: int) -> dict:
     }
 
     preview = ", ".join(str(f.tolist()) for f in faces[:3])
-    logging.debug(
-        f"[cityjson] Solid built with {len(faces)} faces "
-        f"(vbase={base_index}, first_faces={preview})"
-    )
+    logging.debug(f"[cityjson] Solid built with {len(faces)} faces (vbase={base_index}, first_faces={preview})")
 
     return solid
 
@@ -103,12 +100,9 @@ def _compute_bbox(city: dict) -> list[float]:
         return [0, 0, 0, 0, 0, 0]
     mins = np.nanmin(verts, axis=0)
     maxs = np.nanmax(verts, axis=0)
-    bbox = [float(mins[0]), float(mins[1]), float(mins[2]),
-            float(maxs[0]), float(maxs[1]), float(maxs[2])]
+    bbox = [float(mins[0]), float(mins[1]), float(mins[2]), float(maxs[0]), float(maxs[1]), float(maxs[2])]
     logging.debug(f"[cityjson] Bounding box computed: {bbox}")
     return bbox
-
-
 
 
 # ---------------------------------------------------------------------
@@ -142,8 +136,7 @@ def add_tree(
         faces = np.asarray(comp["faces"], dtype=int)
 
         logging.debug(
-            f"[GTID {gtid}] {role}: verts_local={verts_local.shape}, "
-            f"faces={faces.shape}, offset={offset.tolist()}"
+            f"[GTID {gtid}] {role}: verts_local={verts_local.shape}, faces={faces.shape}, offset={offset.tolist()}"
         )
 
         verts_global = verts_local + offset
@@ -155,8 +148,7 @@ def add_tree(
         geometries.append(solid)
 
         logging.debug(
-            f"[GTID {gtid}] Added {role} geometry: "
-            f"{len(verts_local)} verts, {len(faces)} faces, vbase={vbase}"
+            f"[GTID {gtid}] Added {role} geometry: {len(verts_local)} verts, {len(faces)} faces, vbase={vbase}"
         )
 
     city["CityObjects"][obj_id] = {
@@ -166,9 +158,9 @@ def add_tree(
     }
 
     logging.debug(
-        f"[GTID {gtid}] Final CityObject has {len(geometries)} geometries, "
-        f"total vertices={len(city['vertices'])}"
+        f"[GTID {gtid}] Final CityObject has {len(geometries)} geometries, total vertices={len(city['vertices'])}"
     )
+
 
 # ---------------------------------------------------------------------
 # Finalization
@@ -179,6 +171,7 @@ def finalize_cityjson(city: dict, crs: str | None = None) -> dict:
     """
     if crs is None:
         from src.config import get_config
+
         crs = get_config()["crs"]
 
     if not city["vertices"]:
@@ -211,7 +204,7 @@ def finalize_cityjson(city: dict, crs: str | None = None) -> dict:
     }
 
     # --- 4. Logging ---
-    dx, dy, dz = (bmax - bmin)
+    dx, dy, dz = bmax - bmin
     logging.info(
         f"[cityjson] Finalized with {len(city['CityObjects'])} objects, "
         f"{len(V_int)} vertices, "

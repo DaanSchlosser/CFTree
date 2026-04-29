@@ -28,28 +28,34 @@ Outputs:
 """
 
 from __future__ import annotations
+
 import logging
 from collections import OrderedDict
-from typing import Optional
+
 import numpy as np
 import trimesh
-
 
 # ---------------------------------------------------------------------
 # Canonical attribute order (extendable later)
 # ---------------------------------------------------------------------
 ATTR_KEYS = [
-    "gtid", "tile_id",
-    "crown_width_m", "crown_median_z", "crown_r50_m", "crown_porosity",
-    "trunk_H_m", "trunk_DBH_m", "trunk_radius_m",
-    "trunk_base_height_m"
+    "gtid",
+    "tile_id",
+    "crown_width_m",
+    "crown_median_z",
+    "crown_r50_m",
+    "crown_porosity",
+    "trunk_H_m",
+    "trunk_DBH_m",
+    "trunk_radius_m",
+    "trunk_base_height_m",
 ]
 
 
 # ---------------------------------------------------------------------
 # Geometry builders
 # ---------------------------------------------------------------------
-def _build_crown_solid(mesh: trimesh.Trimesh, gtid: Optional[int] = None) -> Optional[dict]:
+def _build_crown_solid(mesh: trimesh.Trimesh, gtid: int | None = None) -> dict | None:
     """Return crown as a Solid (LoD3)."""
     if mesh.is_empty or mesh.vertices.size == 0 or mesh.faces.size == 0:
         logging.debug(f"[GTID {gtid}] Crown mesh empty — skipped.")
@@ -76,8 +82,8 @@ def _build_trunk_solid(
     trunk_base: np.ndarray,
     r_trunk: float,
     crown_median_z: float,
-    gtid: Optional[int] = None,
-) -> Optional[dict]:
+    gtid: int | None = None,
+) -> dict | None:
     """Return slanted trunk as a Solid (LoD3)."""
     try:
         if trunk_base is None or not np.all(np.isfinite(trunk_base)):
@@ -125,7 +131,7 @@ def _build_trunk_solid(
 # ---------------------------------------------------------------------
 # Attribute normalization
 # ---------------------------------------------------------------------
-def _normalize_attributes(metrics: dict, gtid: int, tile_id: Optional[str] = None) -> OrderedDict:
+def _normalize_attributes(metrics: dict, gtid: int, tile_id: str | None = None) -> OrderedDict:
     """
     Flatten and order attributes to a stable OrderedDict with None for missing.
     """
@@ -136,14 +142,14 @@ def _normalize_attributes(metrics: dict, gtid: int, tile_id: Optional[str] = Non
         "gtid": gtid,
         "tile_id": tile_id,
         "crown_width_m": crown.get("CW_m"),
-        "crown_median_z": crown.get("median_z"),   
+        "crown_median_z": crown.get("median_z"),
         "crown_r50_m": crown.get("r50_m"),
         "crown_porosity": crown.get("porosity"),
         "trunk_H_m": trunk.get("H_m"),
         "trunk_DBH_m": trunk.get("DBH_m"),
         "trunk_radius_m": trunk.get("r_trunk"),
     }
-    base = trunk.get("base_xyz")                         
+    base = trunk.get("base_xyz")
 
     if base is not None and len(base) == 3:
         vals.update({"trunk_base_height_m": base[2]})
@@ -152,7 +158,7 @@ def _normalize_attributes(metrics: dict, gtid: int, tile_id: Optional[str] = Non
 
     ordered = OrderedDict()
     for k in ATTR_KEYS:
-        v = vals.get(k, None)
+        v = vals.get(k)
         if isinstance(v, float) and not np.isfinite(v):
             v = None
         ordered[k] = v
@@ -174,8 +180,8 @@ def construct_lod3(
     crown_mesh: trimesh.Trimesh,
     metrics: dict,
     offset_global: list[float] | np.ndarray,
-    gtid: Optional[int] = None,
-    tile_id: Optional[str] = None,
+    gtid: int | None = None,
+    tile_id: str | None = None,
 ) -> dict:
     """
     Construct LoD3 geometries (crown + trunk) for one tree in local coordinates.
@@ -196,7 +202,6 @@ def construct_lod3(
         logging.warning(f"[{tile_id}] [{gtid_str}] No valid crown component created.")
 
     # --- Trunk Solid ---
-    trunk_base = None
     try:
         trunk_base_global = np.array(metrics["trunk"]["base_xyz"], dtype=float)
         trunk_base_local = trunk_base_global - np.asarray(offset_global, dtype=float)
@@ -212,9 +217,8 @@ def construct_lod3(
         trunk_base=trunk_base_local,
         r_trunk=float(metrics.get("trunk", {}).get("r_trunk", np.nan)),
         crown_median_z=crown_median_z_local,
-        gtid=gtid
+        gtid=gtid,
     )
-
 
     if trunk_comp is not None:
         components.append(trunk_comp)
@@ -235,8 +239,8 @@ def construct_lod3(
 
     logging.info(
         f"[{tile_id}] [{gtid_str}] Constructed {len(components)} LoD3 components "
-        f"(Crown={any(c['role']=='crown' for c in components)}, "
-        f"Trunk={any(c['role']=='trunk' for c in components)})"
+        f"(Crown={any(c['role'] == 'crown' for c in components)}, "
+        f"Trunk={any(c['role'] == 'trunk' for c in components)})"
     )
 
     return {"components": components, "attributes": attributes}

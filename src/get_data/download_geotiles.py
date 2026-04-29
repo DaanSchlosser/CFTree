@@ -28,8 +28,12 @@ def download_tile(
     lax_path = tile_folder / "raw.lax"
 
     laz_status = _ensure_file(
-        url=source.laz_url(tile_id), dest=laz_path,
-        tile_id=tile_id, label="LAZ", overwrite=overwrite, required=True,
+        url=source.laz_url(tile_id),
+        dest=laz_path,
+        tile_id=tile_id,
+        label="LAZ",
+        overwrite=overwrite,
+        required=True,
     )
     if laz_status != "ok":
         return {"tile_id": tile_id, "status": laz_status, "paths": {"laz": None, "lax": None}}
@@ -38,8 +42,12 @@ def download_tile(
     lax_final: Path | None = None
     if lax_url is not None:
         lax_status = _ensure_file(
-            url=lax_url, dest=lax_path,
-            tile_id=tile_id, label="LAX", overwrite=overwrite, required=False,
+            url=lax_url,
+            dest=lax_path,
+            tile_id=tile_id,
+            label="LAX",
+            overwrite=overwrite,
+            required=False,
         )
         if lax_status == "ok":
             lax_final = lax_path
@@ -48,8 +56,12 @@ def download_tile(
 
 
 def _ensure_file(
-    url: str, dest: Path, tile_id: str, label: str,
-    overwrite: bool, required: bool,
+    url: str,
+    dest: Path,
+    tile_id: str,
+    label: str,
+    overwrite: bool,
+    required: bool,
 ) -> str:
     """Stream `url` to `dest` unless it already exists. Returns a status string.
 

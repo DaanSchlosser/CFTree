@@ -8,21 +8,44 @@
 Central configuration for the CFTree pipeline.
 """
 
-from pathlib import Path
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TypedDict
+
+
+class DefaultConfig(TypedDict):
+    case_root: Path
+    data_root: Path
+    resources_dir: Path
+    case: str
+    default_cores: int
+    crs: str
+
+
+class ResolvedConfig(TypedDict):
+    case_root: Path
+    data_root: Path
+    resources_dir: Path
+    case: str
+    default_cores: int
+    crs: str
+    case_path: Path
+    data_case_path: Path
+
 
 # ---------------------------------------------------------------------
 # Default case configurations
 # ---------------------------------------------------------------------
-DEFAULT_CONFIG = {
-    "case_root": Path("cases"),             # user case input directory
-    "data_root": Path("data"),              # data storage root (large files)
-    "resources_dir": Path("resources"),     # shared resources
-    "case": "wippolder",                    # default case
-    "default_cores": 2,                     # global default for parallelization
-    "crs": "EPSG:28992",                    # Amersfoort / RD New
+DEFAULT_CONFIG: DefaultConfig = {
+    "case_root": Path("cases"),  # user case input directory
+    "data_root": Path("data"),  # data storage root (large files)
+    "resources_dir": Path("resources"),  # shared resources
+    "case": "wippolder",  # default case
+    "default_cores": 2,  # global default for parallelization
+    "crs": "EPSG:28992",  # Amersfoort / RD New
 }
+
 
 # ---------------------------------------------------------------------
 # Logging setup
@@ -57,9 +80,9 @@ def setup_logger(case: str, logfile_name: str, level: str = "INFO") -> Path:
     )
 
     # UTC timestamps
-    logging.Formatter.converter = lambda *args: datetime.now(timezone.utc).timetuple()
+    logging.Formatter.converter = lambda *_args: datetime.now(UTC).timetuple()
 
-    banner = "\n" + "="*40 + f" NEW SESSION {datetime.now(timezone.utc).isoformat()}Z" + "="*40
+    banner = "\n" + "=" * 40 + f" NEW SESSION {datetime.now(UTC).isoformat()}Z" + "=" * 40
     logging.info(banner)
     logging.info(f"Logging to: {log_path}")
     return log_path
@@ -68,7 +91,7 @@ def setup_logger(case: str, logfile_name: str, level: str = "INFO") -> Path:
 # ---------------------------------------------------------------------
 # Config management
 # ---------------------------------------------------------------------
-def get_config(case_name: str | None = None, n_cores: int | None = None) -> dict:
+def get_config(case_name: str | None = None, n_cores: int | None = None) -> ResolvedConfig:
     """
     Return resolved configuration with canonical paths and compute settings.
 
@@ -81,27 +104,26 @@ def get_config(case_name: str | None = None, n_cores: int | None = None) -> dict
 
     If not provided, defaults to 'wippolder' and 2 cores.
     """
-    cfg = DEFAULT_CONFIG.copy()
+    case_name = case_name if case_name is not None else DEFAULT_CONFIG["case"]
+    n_cores = n_cores if n_cores is not None else DEFAULT_CONFIG["default_cores"]
 
-    # Override defaults if arguments are provided
-    case_name = case_name or cfg["case"]
-    n_cores = n_cores or cfg["default_cores"]
+    case_root = Path(DEFAULT_CONFIG["case_root"]).expanduser().resolve()
+    data_root = Path(DEFAULT_CONFIG["data_root"]).expanduser().resolve()
+    resources_dir = Path(DEFAULT_CONFIG["resources_dir"]).expanduser().resolve()
 
-    resolved = {
-        "case_root": Path(cfg["case_root"]).expanduser().resolve(),
-        "data_root": Path(cfg["data_root"]).expanduser().resolve(),
-        "resources_dir": Path(cfg["resources_dir"]).expanduser().resolve(),
+    data_case_path = data_root / case_name
+    data_case_path.mkdir(parents=True, exist_ok=True)
+
+    return {
+        "case_root": case_root,
+        "data_root": data_root,
+        "resources_dir": resources_dir,
         "case": case_name,
         "default_cores": int(n_cores),
-        "crs": cfg["crs"],
+        "crs": DEFAULT_CONFIG["crs"],
+        "case_path": case_root / case_name,
+        "data_case_path": data_case_path,
     }
-
-    # Derived paths
-    resolved["case_path"] = resolved["case_root"] / case_name
-    resolved["data_case_path"] = resolved["data_root"] / case_name
-    resolved["data_case_path"].mkdir(parents=True, exist_ok=True)
-
-    return resolved
 
 
 # ---------------------------------------------------------------------

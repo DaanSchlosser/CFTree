@@ -4,8 +4,8 @@
 
 # src/get_data/clip_tile.py
 
-import subprocess
 import logging
+import subprocess
 from pathlib import Path
 
 
@@ -58,15 +58,13 @@ def clip_tile(laz_path: Path, aoi_path: Path, output_dir: Path | None = None, ov
                 str(clipped_path),
             ],
             check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         )
         if clipped_path.exists():
             logging.info(f"[{tile_id}] Clipped successfully → {clipped_path}")
             return {"tile_id": tile_id, "status": "ok", "paths": {"clipped": clipped_path}}
-        else:
-            logging.warning(f"[{tile_id}] Clipping completed but file missing: {clipped_path}")
-            return {"tile_id": tile_id, "status": "failed", "paths": {"clipped": None}}
+        logging.warning(f"[{tile_id}] Clipping completed but file missing: {clipped_path}")
+        return {"tile_id": tile_id, "status": "failed", "paths": {"clipped": None}}
 
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.decode(errors="ignore").strip()

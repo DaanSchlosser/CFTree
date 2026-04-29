@@ -37,6 +37,7 @@ failure and the chunk is retried, with a small budget.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import json
 import logging
@@ -46,7 +47,6 @@ import pickle
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
 
 import laspy
 import numpy as np
@@ -54,7 +54,7 @@ import trimesh
 from scipy.spatial import cKDTree
 from trimesh import load as load_mesh
 
-from src.config import get_config, setup_logger
+from src.config import ResolvedConfig, get_config, setup_logger
 from src.reconstruction.alpha_wrap_tree import alpha_wrap_tree
 from src.reconstruction.construct_geometry import construct_lod3
 from src.reconstruction.extract_tree_metrics import compute_tree_metrics
@@ -118,9 +118,7 @@ def _read_int_set(path: Path) -> set[int]:
     if not path.exists():
         return set()
     try:
-        return {
-            int(line.strip()) for line in path.read_text().splitlines() if line.strip()
-        }
+        return {int(line.strip()) for line in path.read_text().splitlines() if line.strip()}
     except Exception:
         return set()
 
@@ -169,7 +167,7 @@ def process_chunk(
     chunk_size: int,
     overwrite: bool,
     keep_cache: bool,
-    max_trees: Optional[int],
+    max_trees: int | None,
     result_q: mp.Queue,
 ) -> None:
     """Process up to `chunk_size` pending trees from a tile, then exit.
@@ -232,11 +230,7 @@ def process_chunk(
         result_q.put({"tile_id": tile_id, "status": "empty_tile"})
         return
 
-    pending = [
-        int(g)
-        for g in unique_gtids
-        if int(g) not in completed and int(g) not in skipped
-    ]
+    pending = [int(g) for g in unique_gtids if int(g) not in completed and int(g) not in skipped]
     n_total = len(unique_gtids)
 
     # Build a single gtid -> indices map up front. Scanning `las["gtid"] == gid`
@@ -247,12 +241,10 @@ def process_chunk(
     sort_order = np.argsort(gtid_arr, kind="stable")
     sorted_gtids = gtid_arr[sort_order]
     boundaries = np.searchsorted(sorted_gtids, np.array(pending, dtype=gtid_arr.dtype))
-    boundaries_end = np.searchsorted(
-        sorted_gtids, np.array(pending, dtype=gtid_arr.dtype), side="right"
-    )
+    boundaries_end = np.searchsorted(sorted_gtids, np.array(pending, dtype=gtid_arr.dtype), side="right")
     gtid_indices: dict[int, np.ndarray] = {
         gid: sort_order[start:end]
-        for gid, start, end in zip(pending, boundaries, boundaries_end)
+        for gid, start, end in zip(pending, boundaries, boundaries_end, strict=True)
     }
 
     logging.info(
@@ -265,9 +257,7 @@ def process_chunk(
         if n_processed_this_chunk >= chunk_size:
             # Hand off to the next worker; this worker exits cleanly so the
             # OS reclaims its accumulated C-extension memory.
-            logging.info(
-                f"[{tile_id}] Chunk budget reached ({chunk_size} trees); recycling worker"
-            )
+            logging.info(f"[{tile_id}] Chunk budget reached ({chunk_size} trees); recycling worker")
             result_q.put(
                 {
                     "tile_id": tile_id,
@@ -297,9 +287,7 @@ def process_chunk(
 
         res_alpha = alpha_wrap_tree(xyz_path, cache_dir, overwrite=False)
         if res_alpha["status"] not in ("ok", "skipped"):
-            logging.warning(
-                f"[{tile_id}] GTID {gid}: alpha wrap failed ({res_alpha['status']})"
-            )
+            logging.warning(f"[{tile_id}] GTID {gid}: alpha wrap failed ({res_alpha['status']})")
             in_flight_path.unlink(missing_ok=True)
             continue
 
@@ -322,9 +310,7 @@ def process_chunk(
             in_flight_path.unlink(missing_ok=True)
             continue
 
-        _save_tree_pkl(
-            trees_dir, gid, tree_geom["components"], offset, tree_geom["attributes"]
-        )
+        _save_tree_pkl(trees_dir, gid, tree_geom["components"], offset, tree_geom["attributes"])
         completed.add(gid)
         n_processed_this_chunk += 1
 
@@ -348,19 +334,14 @@ def process_chunk(
 
     n_objects = len(city["CityObjects"])
     if n_objects == 0:
-        logging.warning(
-            f"[{tile_id}] No trees reconstructed — skipping CityJSON write."
-        )
+        logging.warning(f"[{tile_id}] No trees reconstructed — skipping CityJSON write.")
         result_q.put({"tile_id": tile_id, "status": "empty_tile"})
         return
 
     city_final = finalize_cityjson(city)
     with open(cityjson_path, "w", encoding="utf-8") as f:
         json.dump(city_final, f, indent=2)
-    logging.info(
-        f"[{tile_id}] CityJSON written: {cityjson_path.name} "
-        f"({n_objects} trees, {len(skipped)} skipped)"
-    )
+    logging.info(f"[{tile_id}] CityJSON written: {cityjson_path.name} ({n_objects} trees, {len(skipped)} skipped)")
 
     if not keep_cache:
         shutil.rmtree(cache_dir, ignore_errors=True)
@@ -378,9 +359,7 @@ def process_chunk(
 # ---------------------------------------------------------------------
 # Worker entry: configures logging then runs the chunk
 # ---------------------------------------------------------------------
-def _worker_entry(
-    tile_dir, cfg, chunk_size, overwrite, keep_cache, max_trees, log_level, result_q
-):
+def _worker_entry(tile_dir, cfg, chunk_size, overwrite, keep_cache, max_trees, log_level, result_q):
     setup_logger(cfg["case"], "tree_reconstruction", level=log_level)
     for noisy in ["trimesh", "rasterio", "fiona", "shapely"]:
         logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -392,11 +371,11 @@ def _worker_entry(
 # ---------------------------------------------------------------------
 def _run_tile(
     tile_dir: Path,
-    cfg: dict,
+    cfg: ResolvedConfig,
     chunk_size: int,
     overwrite: bool,
     keep_cache: bool,
-    max_trees: Optional[int],
+    max_trees: int | None,
     log_level: str,
 ) -> dict:
     tile_id = tile_dir.name
@@ -441,9 +420,7 @@ def _run_tile(
 
         timed_out = proc.is_alive()
         if timed_out:
-            logging.warning(
-                f"[{tile_id}] Chunk {chunks_run} hit {_CHUNK_TIMEOUT_S}s timeout — terminating"
-            )
+            logging.warning(f"[{tile_id}] Chunk {chunks_run} hit {_CHUNK_TIMEOUT_S}s timeout — terminating")
             proc.terminate()
             proc.join(timeout=10)
             if proc.is_alive():
@@ -456,10 +433,8 @@ def _run_tile(
         # Crashes may not put anything; the timeout ensures we don't wait
         # forever in that case.
         result = None
-        try:
+        with contextlib.suppress(Exception):
             result = result_q.get(timeout=_QUEUE_DRAIN_TIMEOUT_S)
-        except Exception:
-            pass
 
         if result is not None and result.get("status") in (
             "complete",
@@ -482,9 +457,7 @@ def _run_tile(
         # Worker died. Inspect the in-flight marker to identify the likely culprit gtid, and
         # update the crash counters. If the same gtid causes _PATHOLOGY_THRESHOLD consecutive
         # crashes, mark it pathological and skip it permanently.
-        in_flight = (
-            in_flight_path.read_text().strip() if in_flight_path.exists() else ""
-        )
+        in_flight = in_flight_path.read_text().strip() if in_flight_path.exists() else ""
         n_completed = len(list(trees_dir.glob("*.pkl"))) if trees_dir.exists() else 0
         reason = "timeout" if timed_out else f"exitcode={proc.exitcode}"
         consecutive_crashes += 1
@@ -535,9 +508,7 @@ def _run_tile(
 # ---------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Run 3D tree reconstruction (Step 3)")
-    parser.add_argument(
-        "--case", type=str, help="Case name (default from config if omitted)"
-    )
+    parser.add_argument("--case", type=str, help="Case name (default from config if omitted)")
     parser.add_argument(
         "--n-cores",
         type=int,
@@ -547,9 +518,7 @@ def main():
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--keep-cache", action="store_true")
-    parser.add_argument(
-        "--max-trees", type=int, default=None, help="Limit trees per tile (for testing)"
-    )
+    parser.add_argument("--max-trees", type=int, default=None, help="Limit trees per tile (for testing)")
     parser.add_argument(
         "--chunk-size",
         type=int,
@@ -570,9 +539,7 @@ def main():
     for noisy in ["trimesh", "rasterio", "fiona", "shapely"]:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    logging.info(
-        f"Reconstruction starting: case={case}, n_cores={n_cores}, chunk_size={args.chunk_size}"
-    )
+    logging.info(f"Reconstruction starting: case={case}, n_cores={n_cores}, chunk_size={args.chunk_size}")
 
     tiles_root = cfg["data_root"] / case / "tiles"
     if not tiles_root.exists():
@@ -608,23 +575,15 @@ def main():
             )
 
     ok = [r for r in results if r["status"] in ("ok", "complete", "exists")]
-    failed = [
-        r
-        for r in results
-        if r["status"] in ("failed", "stalled", "failed_max_attempts")
-    ]
+    failed = [r for r in results if r["status"] in ("failed", "stalled", "failed_max_attempts")]
     other = [r for r in results if r not in ok and r not in failed]
     logging.info(f"Reconstruction summary: {len(ok)}/{len(results)} ok")
     if failed:
-        logging.warning(
-            f"{len(failed)} tile(s) failed: "
-            + ", ".join(f"{r['tile_id']}({r['status']})" for r in failed)
-        )
+        failed_summary = ", ".join(f"{r['tile_id']}({r['status']})" for r in failed)
+        logging.warning(f"{len(failed)} tile(s) failed: {failed_summary}")
     if other:
-        logging.info(
-            f"{len(other)} tile(s) other: "
-            + ", ".join(f"{r['tile_id']}({r['status']})" for r in other)
-        )
+        other_summary = ", ".join(f"{r['tile_id']}({r['status']})" for r in other)
+        logging.info(f"{len(other)} tile(s) other: {other_summary}")
 
 
 if __name__ == "__main__":

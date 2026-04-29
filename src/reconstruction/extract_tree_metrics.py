@@ -27,18 +27,17 @@ Outputs:
 """
 
 from __future__ import annotations
+
 import logging
 from pathlib import Path
+
 import numpy as np
-import trimesh
 import rasterio
+import shapely
+import trimesh
 from rasterio import mask
 from scipy.spatial import ConvexHull, cKDTree
-
-import shapely
 from shapely.geometry import Polygon
-
-
 
 
 # ---------------------------------------------------------------------
@@ -108,9 +107,7 @@ def _compute_porosity(mesh: trimesh.Trimesh, pts_xyz: np.ndarray, voxel_size: fl
 
         ci = np.floor((interior - bmin) / voxel_size).astype(int)
         valid2 = (
-            (ci[:, 0] >= 0) & (ci[:, 0] < nx) &
-            (ci[:, 1] >= 0) & (ci[:, 1] < ny) &
-            (ci[:, 2] >= 0) & (ci[:, 2] < nz)
+            (ci[:, 0] >= 0) & (ci[:, 0] < nx) & (ci[:, 1] >= 0) & (ci[:, 1] < ny) & (ci[:, 2] >= 0) & (ci[:, 2] < nz)
         )
         ci = ci[valid2]
         occ_interior = np.sum(occ[ci[:, 1], ci[:, 0], ci[:, 2]])
@@ -123,12 +120,12 @@ def _compute_porosity(mesh: trimesh.Trimesh, pts_xyz: np.ndarray, voxel_size: fl
         return np.nan
 
 
-
 # ---------------------------------------------------------------------
 # r50 nearest-neighbor distance
 # ---------------------------------------------------------------------
-def _compute_r50(mesh: trimesh.Trimesh, pts_xyz: np.ndarray,
-                 nn_samples: int = 600_000, voxel_ds: float = 0.02) -> float:
+def _compute_r50(
+    mesh: trimesh.Trimesh, pts_xyz: np.ndarray, nn_samples: int = 600_000, voxel_ds: float = 0.02
+) -> float:
     """
     Compute median NN distance (r50) between interior voxels and vegetation points.
     """
@@ -153,7 +150,6 @@ def _compute_r50(mesh: trimesh.Trimesh, pts_xyz: np.ndarray,
     except Exception as e:
         logging.warning(f"r50 computation failed: {e}")
         return np.nan
-
 
 
 # ---------------------------------------------------------------------
@@ -203,7 +199,7 @@ def compute_trunk_base_from_dtm(
 
         # --- translate to global coordinates for raster sampling (ignore z offset)
         poly_global = shapely.affinity.translate(poly_local, xoff=offset[0], yoff=offset[1])
-        
+
         # --- open DTM and extract values under crown
         with rasterio.open(dtm_path) as src:
             out_img, out_transform = mask.mask(src, [poly_global], crop=True, filled=False)
@@ -233,8 +229,9 @@ def compute_trunk_base_from_dtm(
         return None
 
 
-def estimate_trunk_dimensions(CW_m: float, crown_median_z: float, trunk_base_z: float,
-                              a=1.0, b=1.1, c=0.7) -> tuple[float, float, float]:
+def estimate_trunk_dimensions(
+    CW_m: float, crown_median_z: float, trunk_base_z: float, a=1.0, b=1.1, c=0.7
+) -> tuple[float, float, float]:
     """
     Returns (H, DBH_m, r_trunk_m). Applies simple allometry; no slenderness clamp by default.
     """
@@ -243,7 +240,7 @@ def estimate_trunk_dimensions(CW_m: float, crown_median_z: float, trunk_base_z: 
     H = float(crown_median_z - trunk_base_z)
     if H <= 0:
         return (H, np.nan, np.nan)
-    DBH_m = float(a * (CW_m ** b) * (H ** c) / 100.0)
+    DBH_m = float(a * (CW_m**b) * (H**c) / 100.0)
     r_trunk = 0.5 * DBH_m if np.isfinite(DBH_m) and DBH_m > 0 else np.nan
     return (H, DBH_m, r_trunk)
 
@@ -269,12 +266,8 @@ def compute_tree_metrics(
         CW_m = CW_local
         crown_median_z = crown_median_z_local + offset[2]
 
-        logging.debug(
-            f"Crown metrics (local): CW={CW_local:.3f}, median_z_local={crown_median_z_local:.3f}"
-        )
-        logging.debug(
-            f"Crown metrics (global): CW={CW_m:.3f}, median_z={crown_median_z:.3f}"
-        )
+        logging.debug(f"Crown metrics (local): CW={CW_local:.3f}, median_z_local={crown_median_z_local:.3f}")
+        logging.debug(f"Crown metrics (global): CW={CW_m:.3f}, median_z={crown_median_z:.3f}")
 
         # --- Estimate trunk base (global) ---
         logging.debug("========== Estimating trunk base from DTM...")
@@ -286,9 +279,7 @@ def compute_tree_metrics(
         H_m, DBH_m, r_trunk = estimate_trunk_dimensions(
             CW_m, crown_median_z, trunk_base[2] if trunk_base is not None else np.nan
         )
-        logging.debug(
-            f"Trunk dimensions: H={H_m:.3f}, DBH={DBH_m:.3f}, r_trunk={r_trunk:.3f}"
-        )
+        logging.debug(f"Trunk dimensions: H={H_m:.3f}, DBH={DBH_m:.3f}, r_trunk={r_trunk:.3f}")
 
         # --- Compute r50 and porosity ---
         logging.debug("========== Computing r50 and porosity...")
@@ -309,9 +300,7 @@ def compute_tree_metrics(
                 "H_m": H_m,
                 "DBH_m": DBH_m,
                 "r_trunk": r_trunk,
-                "base_xyz": (
-                    trunk_base.tolist() if trunk_base is not None else [np.nan, np.nan, np.nan]
-                ),
+                "base_xyz": (trunk_base.tolist() if trunk_base is not None else [np.nan, np.nan, np.nan]),
             },
             "status": "ok",
         }

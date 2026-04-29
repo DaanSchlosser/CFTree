@@ -92,9 +92,7 @@ class AHN6KMSource(TileSource):
         ids: list[str] = []
         for x in range(x_start, x_stop, self.TILE_SIZE):
             for y in range(y_start, y_stop, self.TILE_SIZE):
-                if sg.box(x, y, x + self.TILE_SIZE, y + self.TILE_SIZE).intersects(
-                    aoi_geom
-                ):
+                if sg.box(x, y, x + self.TILE_SIZE, y + self.TILE_SIZE).intersects(aoi_geom):
                     ids.append(f"{x:06d}_{y:06d}")
         return ids
 
@@ -103,9 +101,7 @@ class AHN6KMSource(TileSource):
 
     @classmethod
     def _floor_to_grid(cls, value: float, origin: int) -> int:
-        return (
-            origin + int(math.floor((value - origin) / cls.TILE_SIZE)) * cls.TILE_SIZE
-        )
+        return origin + int(math.floor((value - origin) / cls.TILE_SIZE)) * cls.TILE_SIZE
 
 
 def from_version(version: int, resources_dir: Path) -> TileSource:
@@ -113,9 +109,7 @@ def from_version(version: int, resources_dir: Path) -> TileSource:
     if version in (4, 5):
         return GeoTilesSource(
             version=version,
-            index_shp=resources_dir
-            / "AHN_subunits_GeoTiles"
-            / "AHN_subunits_GeoTiles.shp",
+            index_shp=resources_dir / "AHN_subunits_GeoTiles" / "AHN_subunits_GeoTiles.shp",
         )
     if version == 6:
         logging.info(

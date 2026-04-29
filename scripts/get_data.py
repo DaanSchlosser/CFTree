@@ -153,8 +153,7 @@ def main():
         return
 
     logging.info(
-        f"Found {len(tile_ids)} intersecting tiles: "
-        f"{tile_ids if len(tile_ids) <= 10 else tile_ids[:10] + ['...']}"
+        f"Found {len(tile_ids)} intersecting tiles: {tile_ids if len(tile_ids) <= 10 else tile_ids[:10] + ['...']}"
     )
 
     if args.dry_run:

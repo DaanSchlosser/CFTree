@@ -18,15 +18,16 @@ Returns:
 """
 
 from __future__ import annotations
+
 import logging
 import subprocess
 from pathlib import Path
-import pandas as pd
+
 import geopandas as gpd
+import pandas as pd
 from shapely.geometry import MultiPoint
 
 from src.config import get_config
-
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -86,7 +87,7 @@ def segment_tile(tile_dir: Path, overwrite: bool = False) -> dict:
 
     logging.info(f"[{tile_id}] Running segmentation binary...")
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.strip()
         logging.warning(f"[{tile_id}] Segmentation failed: {stderr}")

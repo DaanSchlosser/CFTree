@@ -1,0 +1,120 @@
+[project]
+name = "cftree"
+version = "0.1.0"
+description = "CFTree pipeline: get_data → segmentation → reconstruction"
+requires-python = ">=3.11"
+
+# ---------------------------------------------------------------------
+# Ruff — fast Python linter + formatter
+# ---------------------------------------------------------------------
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [
+    "src/reconstruction/AlphaWrap",
+    "src/segmentation/TreeSeparation",
+    "cases",
+    "data",
+    "results",
+    "tmp",
+    ".tmp_*",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+# Curated rule set: pycodestyle, pyflakes, isort, pyupgrade, bugbear,
+# comprehensions, naming, simplify, return-style, logging.
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "RET", # flake8-return
+    "G",   # flake8-logging-format
+    "N",   # pep8-naming
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "B008",  # function calls in default args (common with argparse / Path)
+    "N803",  # argument names — geospatial code uses X/Y/Z
+    "N806",  # variable names — same reason
+    "G004",  # f-string in logging — pervasive in this codebase, not a real risk
+    "SIM108", # ternary suggestions — sometimes less readable
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["E402"]  # CLI scripts may set sys.path before imports
+"main.py" = ["E402"]
+"__init__.py" = ["F401"]   # re-exports
+"src/vegetation_filter/HOMED_vegetation_filter.py" = ["N999"]  # HOMED is an algorithm acronym
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# ---------------------------------------------------------------------
+# MyPy — static type checking
+# ---------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+check_untyped_defs = true
+no_implicit_optional = true
+ignore_missing_imports = true   # geospatial stack ships limited stubs
+exclude = [
+    "src/reconstruction/AlphaWrap/",
+    "src/segmentation/TreeSeparation/",
+    "cases/",
+    "data/",
+    "results/",
+    "tmp/",
+    "^\\.tmp_.*\\.py$",
+]
+
+# Geospatial / scientific stack ships limited stubs — treat as untyped.
+# Listed only because we explicitly import them; trimmed when unused.
+[[tool.mypy.overrides]]
+module = [
+    "geopandas.*",
+    "shapely.*",
+    "rasterio.*",
+    "laspy.*",
+    "pdal.*",
+    "trimesh.*",
+    "scipy.*",
+]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------
+# Pyright (engine behind Pylance) — also picked up by pyright CLI
+# ---------------------------------------------------------------------
+[tool.pyright]
+include = ["src", "scripts", "main.py"]
+exclude = [
+    "**/__pycache__",
+    "src/reconstruction/AlphaWrap",
+    "src/segmentation/TreeSeparation",
+    "cases",
+    "data",
+    "results",
+    "tmp",
+    ".tmp_*",
+]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+# Geospatial stack is conda-managed; missing-import noise when pyright runs
+# outside the `cftree` env is expected — silence it. Real type errors still
+# surface via reportGeneralTypeIssues / reportAttributeAccessIssue.
+reportMissingImports = "none"
+reportMissingModuleSource = "none"
+reportMissingTypeStubs = "none"
+reportUnusedImport = "warning"
+reportUnusedVariable = "warning"
+reportGeneralTypeIssues = "warning"

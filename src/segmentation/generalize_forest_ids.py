@@ -21,15 +21,16 @@ Writes:
 """
 
 from __future__ import annotations
-import hashlib
+
 import logging
 from pathlib import Path
+
 import geopandas as gpd
-import pandas as pd
 import laspy
-from shapely.geometry import Point
-from src.config import get_config
 import numpy as np
+import pandas as pd
+
+from src.config import get_config
 
 
 # ---------------------------------------------------------------------
@@ -142,19 +143,13 @@ def generalize_forest_ids(case: str, overwrite: bool = False) -> dict:
         if "gtid" in seg_df.columns:
             seg_df = seg_df.drop(columns=["gtid"])
 
-        seg_df = seg_df.merge(
-            tile_map[["tid", "gtid"]],
-            on="tid",
-            how="inner"
-        )
+        seg_df = seg_df.merge(tile_map[["tid", "gtid"]], on="tid", how="inner")
 
         if seg_df.empty:
             logging.debug(f"[{tile_dir.name}] No matching GTIDs after merge — skipped.")
             continue
 
-
         # Read vegetation.laz
-
 
         # --- Debug diagnostics ----------------------------------------
         logging.debug(f"[{tile_dir.name}] seg_df columns: {list(seg_df.columns)}")
@@ -170,17 +165,12 @@ def generalize_forest_ids(case: str, overwrite: bool = False) -> dict:
             seg_df = seg_df.drop(columns=["gtid"])
 
         # Join with GTID map
-        seg_df = seg_df.merge(
-            tile_map[["tid", "gtid"]],
-            on="tid",
-            how="inner"
-        )
+        seg_df = seg_df.merge(tile_map[["tid", "gtid"]], on="tid", how="inner")
         logging.debug(f"[{tile_dir.name}] After merge seg_df columns: {list(seg_df.columns)}")
         logging.debug(f"[{tile_dir.name}] seg_df rows after merge: {len(seg_df)}")
 
         if "gtid" not in seg_df.columns:
             logging.warning(f"[{tile_dir.name}] No 'gtid' column after merge — will cause forest.laz failure.")
-
 
         try:
             logging.debug(f"Reading vegetation LAS: {veg_path}")
@@ -196,20 +186,19 @@ def generalize_forest_ids(case: str, overwrite: bool = False) -> dict:
 
         # Build spatial index to match by coordinates (approximate)
         logging.debug(f"[{tile_dir.name}] Building vegetation DataFrame for merging.")
-        veg_df = pd.DataFrame({
-            "x": np.asarray(las.x),
-            "y": np.asarray(las.y),
-            "z": np.asarray(las.z),
-        })
+        veg_df = pd.DataFrame(
+            {
+                "x": np.asarray(las.x),
+                "y": np.asarray(las.y),
+                "z": np.asarray(las.z),
+            }
+        )
         # veg_df["gtid"] = pd.NA
 
         # Merge by nearest XYZ (within small tolerance)
         # We assume segmentation.xyz has same coordinates; exact match join is fine.
         logging.debug(f"[{tile_dir.name}] Merging vegetation with segmentation by XYZ.")
-        merged = pd.merge(
-            veg_df, seg_df[["x", "y", "z", "gtid"]],
-            on=["x", "y", "z"], how="inner"
-        )
+        merged = pd.merge(veg_df, seg_df[["x", "y", "z", "gtid"]], on=["x", "y", "z"], how="inner")
         logging.debug(f"[{tile_dir.name}] merged columns: {list(merged.columns)}")
         logging.debug(f"[{tile_dir.name}] merged rows: {len(merged)}")
         if "gtid" not in merged.columns:
@@ -238,8 +227,6 @@ def generalize_forest_ids(case: str, overwrite: bool = False) -> dict:
             if "gtid" not in las_out.point_format.extra_dimension_names:
                 las_out.add_extra_dim(laspy.ExtraBytesParams(name="gtid", type=np.uint32))
             las_out["gtid"] = merged["gtid"].astype(np.uint32).values
-
-
 
             las_out.write(out_forest)
             logging.info(f"[{tile_dir.name}] Wrote forest.laz ({len(las_out.points)} points)")

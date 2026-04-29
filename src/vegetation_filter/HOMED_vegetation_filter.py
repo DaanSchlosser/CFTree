@@ -22,30 +22,33 @@ Returns:
 """
 
 from __future__ import annotations
-import logging, copy, time
-from pathlib import Path
-import numpy as np
-import laspy
-from scipy.spatial import cKDTree
-from scipy import ndimage as ndi
 
+import copy
+import logging
+import time
+from pathlib import Path
+
+import laspy
+import numpy as np
+from scipy import ndimage as ndi
+from scipy.spatial import cKDTree
 
 # ---------------------------------------------------------------------
-# Tunable parameters 
+# Tunable parameters
 # ---------------------------------------------------------------------
 USE_AHN_CLASS_FILTER = False
 
 CORE_B_SOR_K, CORE_B_SOR_SIGMA = 50, 0.9
 CORE_C_SOR_K, CORE_C_SOR_SIGMA = 32, 1.0
 
-USE_MIN_CLUSTER   = True
+USE_MIN_CLUSTER = True
 MINCLUSTER_RADIUS = 0.75
 MINCLUSTER_MINPTS = 30
 
-DILATE_RES_M        = 0.25
-DILATE_RADIUS_M     = 0.6
-DILATE_DZ_ABOVE     = 2.5
-DILATE_DZ_BELOW     = 1.2
+DILATE_RES_M = 0.25
+DILATE_RADIUS_M = 0.6
+DILATE_DZ_ABOVE = 2.5
+DILATE_DZ_BELOW = 1.2
 DILATE_USE_EC_GUARD = True
 
 
@@ -73,9 +76,7 @@ def write_xyz_from_mask(xyz_all: np.ndarray, mask: np.ndarray, out_path: Path) -
 
 def scaled_xyz(las: laspy.LasData) -> np.ndarray:
     s, o = las.header.scales, las.header.offsets
-    return np.vstack((las.X * s[0] + o[0],
-                      las.Y * s[1] + o[1],
-                      las.Z * s[2] + o[2])).T
+    return np.vstack((las.X * s[0] + o[0], las.Y * s[1] + o[1], las.Z * s[2] + o[2])).T
 
 
 # ---------------------------------------------------------------------
@@ -98,8 +99,9 @@ def sor_mask_for_subset(xyz_all: np.ndarray, base_mask: np.ndarray, k: int, sigm
     return out
 
 
-def remove_small_components(xyz_all: np.ndarray, base_mask: np.ndarray,
-                            radius: float = 0.6, min_pts: int = 60) -> np.ndarray:
+def remove_small_components(
+    xyz_all: np.ndarray, base_mask: np.ndarray, radius: float = 0.6, min_pts: int = 60
+) -> np.ndarray:
     idx = np.where(base_mask)[0]
     if idx.size == 0:
         return base_mask.copy()
@@ -133,8 +135,7 @@ def _to_grid_idx(xy: np.ndarray, xmin: float, ymin: float, res: float):
     return ix, iy
 
 
-def dilated_xy_mask_from_core(xyz: np.ndarray, core_mask: np.ndarray,
-                              res: float, radius: float):
+def dilated_xy_mask_from_core(xyz: np.ndarray, core_mask: np.ndarray, res: float, radius: float):
     xy_all = xyz[:, :2]
     core_xy = xy_all[core_mask]
     if core_xy.size == 0:
@@ -156,8 +157,9 @@ def dilated_xy_mask_from_core(xyz: np.ndarray, core_mask: np.ndarray,
     return xmin, ymin, res, dil
 
 
-def points_inside_dilated_mask(xyz: np.ndarray, xmin: float, ymin: float,
-                               res: float, dil_grid: np.ndarray) -> np.ndarray:
+def points_inside_dilated_mask(
+    xyz: np.ndarray, xmin: float, ymin: float, res: float, dil_grid: np.ndarray
+) -> np.ndarray:
     xy = xyz[:, :2]
     ny, nx = dil_grid.shape
     ix, iy = _to_grid_idx(xy, xmin, ymin, res)
@@ -202,8 +204,8 @@ def filter_tile(tile_dir: Path, overwrite: bool = False) -> dict:
                 raise ValueError(f"LAS missing required dimension: {d}")
 
         cls = np.asarray(las.classification)
-        rn  = np.asarray(las.return_number)
-        nr  = np.asarray(las.number_of_returns)
+        rn = np.asarray(las.return_number)
+        nr = np.asarray(las.number_of_returns)
         xyz = scaled_xyz(las)
 
         # Step 01: optional classification == 1
@@ -221,7 +223,8 @@ def filter_tile(tile_dir: Path, overwrite: bool = False) -> dict:
         m_core = m03b_sor | m03c_sor
         if USE_MIN_CLUSTER and m_core.any():
             m_core = remove_small_components(
-                xyz, m_core,
+                xyz,
+                m_core,
                 radius=MINCLUSTER_RADIUS,
                 min_pts=MINCLUSTER_MINPTS,
             )
@@ -230,7 +233,7 @@ def filter_tile(tile_dir: Path, overwrite: bool = False) -> dict:
         core_idx = np.where(m_core)[0]
         cand_mask = m01 & (~m_core)
         if DILATE_USE_EC_GUARD:
-            cand_mask &= (rn < nr)
+            cand_mask &= rn < nr
         cand_idx = np.where(cand_mask)[0]
 
         xmin, ymin, res, dil_grid = dilated_xy_mask_from_core(xyz, m_core, DILATE_RES_M, DILATE_RADIUS_M)
