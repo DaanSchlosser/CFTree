@@ -31,7 +31,6 @@ dependencies:
 
   # --- 3D geometry and visualization ---
   - trimesh
-  - pyembree
   - networkx
   - matplotlib
 
@@ -49,8 +48,14 @@ dependencies:
   - cgal
 
   # --- Pip packages ---
-  # - pip
-  # - pip:
+  - pip
+  - pip:
+      # embreex provides the embree ray-mesh acceleration that trimesh 4.x
+      # uses for `mesh.contains()`. Without it trimesh silently falls back
+      # to pure-Python ray casting, which is orders of magnitude slower and
+      # allocates many GB on moderate inputs (causes OOM in reconstruction).
+      # The 2.17.7.post* line wraps embree 2.17.7 (the conda-forge version).
+      - embreex==2.17.7.post7
       # - cityjson
       # - pycityjson
       # - pdal-plugins

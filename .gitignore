@@ -44,6 +44,11 @@ __pycache__/
 nohup.out
 
 # ----------------------------
+# SCRATCH / DERIVATION ARTIFACTS
+# ----------------------------
+.tmp_*
+
+# ----------------------------
 # LOCAL CONFIG
 # ----------------------------
 cftree_config.yaml
