@@ -4,17 +4,13 @@
 
 # src/segmentation/segment_tile.py
 
-"""
-Wrapper for the C++ TreeSeparation segmentation binary.
+"""Wrapper for the C++ TreeSeparation segmentation binary.
 
 Reads:
     data/<case>/tiles/<tile_id>/vegetation.xyz
 Writes:
     data/<case>/tiles/<tile_id>/segmentation.xyz
     data/<case>/tiles/<tile_id>/tree_hulls.geojson
-
-Returns:
-    {"tile_id": str, "status": "ok"|"skipped"|"failed", "outputs": dict}
 """
 
 from __future__ import annotations
@@ -28,10 +24,9 @@ import pandas as pd
 from shapely.geometry import MultiPoint
 
 from src.config import get_config
+from src.stages import MissingPrerequisiteError, SegmentationResult, StageFailureError
+from src.tile_layout import TileLayout
 
-# ---------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------
 # Parameters passed to segmentation binary
 SEG_PARAMS = {
     "radius": 2.5,
@@ -41,41 +36,33 @@ SEG_PARAMS = {
 cfg = get_config()
 
 
-# ---------------------------------------------------------------------
-# Main function
-# ---------------------------------------------------------------------
-def segment_tile(tile_dir: Path, overwrite: bool = False) -> dict:
-    """
-    Run TreeSeparation C++ segmentation on one tile directory.
+def segment_tile(tile_dir: Path, overwrite: bool = False) -> SegmentationResult:
+    """Run TreeSeparation C++ segmentation on one tile directory.
 
-    Reads:
-        vegetation.xyz
-    Writes:
-        segmentation.xyz, tree_hulls.geojson
+    Raises
+    ------
+    MissingPrerequisiteError
+        Input vegetation.xyz or the C++ binary is missing.
+    StageFailureError
+        Segmentation binary failed or post-processing crashed.
     """
-    tile_id = tile_dir.name
-    input_xyz = tile_dir / "vegetation.xyz"
-    output_xyz = tile_dir / "segmentation.xyz"
-    hulls_geojson = tile_dir / "tree_hulls.geojson"
+    tile = TileLayout(tile_dir)
+    tile_id = tile.tile_id
+    input_xyz = tile.vegetation_xyz
+    output_xyz = tile.segmentation_xyz
+    hulls_geojson = tile.tree_hulls
 
     exe = Path(__file__).parent / "TreeSeparation" / "build" / "segmentation"
 
-    # Pre-checks
     if not input_xyz.exists():
-        logging.warning(f"[{tile_id}] Missing input vegetation.xyz — skipping segmentation.")
-        return {"tile_id": tile_id, "status": "missing_input", "outputs": {}}
-
+        raise MissingPrerequisiteError(f"[{tile_id}] Missing input vegetation.xyz at {input_xyz}")
     if not exe.exists():
-        logging.error(f"[{tile_id}] Missing C++ segmentation binary: {exe}")
-        return {"tile_id": tile_id, "status": "missing_binary", "outputs": {}}
+        raise MissingPrerequisiteError(f"[{tile_id}] Missing C++ segmentation binary: {exe}")
 
     if output_xyz.exists() and hulls_geojson.exists() and not overwrite:
         logging.info(f"[{tile_id}] Segmentation already exists — skipping (use --overwrite to redo).")
-        return {"tile_id": tile_id, "status": "skipped", "outputs": {"seg_xyz": output_xyz, "hulls": hulls_geojson}}
+        return SegmentationResult(segmentation_xyz=output_xyz, tree_hulls=hulls_geojson, did_work=False)
 
-    # ------------------------------------------------------------------
-    # Run segmentation binary
-    # ------------------------------------------------------------------
     cmd = [
         str(exe),
         str(input_xyz),
@@ -89,13 +76,8 @@ def segment_tile(tile_dir: Path, overwrite: bool = False) -> dict:
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
-        stderr = e.stderr.strip()
-        logging.warning(f"[{tile_id}] Segmentation failed: {stderr}")
-        return {"tile_id": tile_id, "status": "failed", "outputs": {}}
+        raise StageFailureError(f"[{tile_id}] Segmentation failed: {e.stderr.strip()}") from e
 
-    # ------------------------------------------------------------------
-    # Post-processing: build convex hulls per tree
-    # ------------------------------------------------------------------
     try:
         seg_df = pd.read_csv(output_xyz, sep=r"\s+", header=None, names=["tid", "x", "y", "z"])
         seg_gdf = gpd.GeoDataFrame(seg_df, geometry=gpd.points_from_xy(seg_df.x, seg_df.y), crs=cfg["crs"])
@@ -115,12 +97,7 @@ def segment_tile(tile_dir: Path, overwrite: bool = False) -> dict:
             logging.warning(f"[{tile_id}] No valid hulls produced.")
 
         logging.info(f"[{tile_id}] Segmentation complete.")
-        return {
-            "tile_id": tile_id,
-            "status": "ok",
-            "outputs": {"seg_xyz": output_xyz, "hulls": hulls_geojson},
-        }
+        return SegmentationResult(segmentation_xyz=output_xyz, tree_hulls=hulls_geojson, did_work=True)
 
     except Exception as e:
-        logging.warning(f"[{tile_id}] Post-processing failed: {e}")
-        return {"tile_id": tile_id, "status": "failed", "outputs": {}}
+        raise StageFailureError(f"[{tile_id}] Segmentation post-processing failed: {e}") from e

@@ -23,7 +23,6 @@ Writes:
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 import geopandas as gpd
 import laspy
@@ -31,37 +30,33 @@ import numpy as np
 import pandas as pd
 
 from src.config import get_config
+from src.stages import GeneralizeForestIdsResult, MissingPrerequisiteError, StageFailureError
+from src.tile_layout import CaseLayout, TileLayout
 
 
-# ---------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------
-def generalize_forest_ids(case: str, overwrite: bool = False) -> dict:
+def generalize_forest_ids(case: str, overwrite: bool = False) -> GeneralizeForestIdsResult:
+    """Create global tree IDs (GTIDs) and write forest.laz per tile.
+
+    Raises
+    ------
+    MissingPrerequisiteError
+        AOI file is missing or empty.
+    StageFailureError
+        No tree hulls inside the AOI across any tile.
     """
-    Create global tree IDs (GTIDs) and write forest.laz per tile.
+    cfg = get_config(case_name=case)
+    layout = CaseLayout.from_config(cfg)
+    tiles_dir = layout.tiles_dir
 
-    Returns:
-        dict with summary info and output paths.
-    """
-    cfg = get_config()
-    data_root = cfg["data_root"]
-    case_dir = data_root / case
-    tiles_dir = case_dir / "tiles"
-
-    # ------------------------------------------------------------------
-    # Load AOI polygon
-    # ------------------------------------------------------------------
-    aoi_path = Path("cases") / case / "case_area.geojson"
+    aoi_path = layout.aoi
     if not aoi_path.exists():
-        logging.error(f"AOI not found: {aoi_path}")
-        return {"case": case, "status": "missing_aoi"}
+        raise MissingPrerequisiteError(f"AOI not found: {aoi_path}")
 
     aoi = gpd.read_file(aoi_path)
     if aoi.empty:
-        logging.error(f"AOI file is empty: {aoi_path}")
-        return {"case": case, "status": "empty_aoi"}
+        raise MissingPrerequisiteError(f"AOI file is empty: {aoi_path}")
 
-    aoi_geom = aoi.to_crs(cfg["crs"]).geometry.unary_union
+    aoi_geom = aoi.to_crs(cfg["crs"]).geometry.union_all()
 
     # ------------------------------------------------------------------
     # Collect all tree hulls within AOI
@@ -70,7 +65,7 @@ def generalize_forest_ids(case: str, overwrite: bool = False) -> dict:
     for tile_dir in sorted(tiles_dir.iterdir()):
         logging.debug(f"Entering tile: {tile_dir}")
 
-        hull_path = tile_dir / "tree_hulls.geojson"
+        hull_path = TileLayout(tile_dir).tree_hulls
         if not hull_path.exists():
             continue
         try:
@@ -84,8 +79,7 @@ def generalize_forest_ids(case: str, overwrite: bool = False) -> dict:
             logging.warning(f"[{tile_dir.name}] Failed reading hulls: {e}")
 
     if not hulls_all:
-        logging.warning(f"No valid tree hulls found inside AOI for case {case}")
-        return {"case": case, "status": "no_hulls"}
+        raise StageFailureError(f"No valid tree hulls found inside AOI for case {case}")
 
     hulls = pd.concat(hulls_all, ignore_index=True)
     hulls = hulls.drop(columns="centroid")
@@ -101,8 +95,8 @@ def generalize_forest_ids(case: str, overwrite: bool = False) -> dict:
     # ------------------------------------------------------------------
     # Write forest-level outputs
     # ------------------------------------------------------------------
-    out_forest_hulls = case_dir / "forest_hulls.geojson"
-    out_gtid_map = case_dir / "gtid_map.csv"
+    out_forest_hulls = layout.forest_hulls
+    out_gtid_map = layout.gtid_map
 
     hulls[["tile_id", "tid", "gtid", "geometry"]].to_file(out_forest_hulls, driver="GeoJSON")
     hulls[["tile_id", "tid", "gtid"]].to_csv(out_gtid_map, index=False)
@@ -114,9 +108,10 @@ def generalize_forest_ids(case: str, overwrite: bool = False) -> dict:
     # ------------------------------------------------------------------
     gtid_map = pd.read_csv(out_gtid_map)
     for tile_dir in sorted(tiles_dir.iterdir()):
-        veg_path = tile_dir / "vegetation.laz"
-        seg_path = tile_dir / "segmentation.xyz"
-        out_forest = tile_dir / "forest.laz"
+        tile = TileLayout(tile_dir)
+        veg_path = tile.vegetation_laz
+        seg_path = tile.segmentation_xyz
+        out_forest = tile.forest_laz
 
         if not veg_path.exists() or not seg_path.exists():
             logging.debug(f"[{tile_dir.name}] Missing vegetation or segmentation file — skipped.")
@@ -233,12 +228,8 @@ def generalize_forest_ids(case: str, overwrite: bool = False) -> dict:
         except Exception as e:
             logging.warning(f"[{tile_dir.name}] Failed writing forest.laz: {e}")
 
-    return {
-        "case": case,
-        "status": "ok",
-        "n_trees": n_trees,
-        "outputs": {
-            "forest_hulls": out_forest_hulls,
-            "gtid_map": out_gtid_map,
-        },
-    }
+    return GeneralizeForestIdsResult(
+        n_trees=n_trees,
+        forest_hulls=out_forest_hulls,
+        gtid_map=out_gtid_map,
+    )

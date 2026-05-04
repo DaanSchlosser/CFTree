@@ -20,34 +20,40 @@ from pathlib import Path
 from src.config import get_config, setup_logger
 from src.segmentation.generalize_forest_ids import generalize_forest_ids
 from src.segmentation.segment_tile import segment_tile
+from src.stages import MissingPrerequisiteError, StageError, TileOutcome
+from src.tile_layout import CaseLayout, TileLayout
 from src.vegetation_filter.HOMED_vegetation_filter import filter_tile
 
 
-# ---------------------------------------------------------------------
-# Per-tile worker (top-level for multiprocessing)
-# ---------------------------------------------------------------------
-def process_tile(tile_dir: Path, overwrite: bool = False) -> dict:
-    """
-    Run vegetation filtering + segmentation for one tile.
-    Returns combined status dict.
+def process_tile(tile_dir: Path, overwrite: bool = False) -> TileOutcome:
+    """Run vegetation filtering + segmentation for one tile.
+
+    Catches `StageError` subclasses to map them to a single `TileOutcome`.
     """
     tile_id = tile_dir.name
     try:
-        # Step 1: vegetation filter
-        result_filter = filter_tile(tile_dir, overwrite)
-        if result_filter["status"] not in ("ok", "skipped"):
-            return {"tile_id": tile_id, "status": f"veg_failed ({result_filter['status']})"}
+        filter_tile(tile_dir, overwrite)
+    except MissingPrerequisiteError as e:
+        logging.warning(f"[{tile_id}] Vegetation filter prerequisite missing: {e}")
+        return TileOutcome(tile_id=tile_id, status="veg_prereq_missing", detail=str(e))
+    except StageError as e:
+        logging.warning(f"[{tile_id}] Vegetation filter failed: {e}")
+        return TileOutcome(tile_id=tile_id, status="veg_failed", detail=str(e))
 
-        # Step 2: segmentation
-        result_seg = segment_tile(tile_dir, overwrite)
-        return {
-            "tile_id": tile_id,
-            "status": f"seg_{result_seg['status']}",
-            "outputs": result_seg.get("outputs", {}),
-        }
+    try:
+        seg = segment_tile(tile_dir, overwrite)
+    except MissingPrerequisiteError as e:
+        logging.warning(f"[{tile_id}] Segmentation prerequisite missing: {e}")
+        return TileOutcome(tile_id=tile_id, status="seg_prereq_missing", detail=str(e))
+    except StageError as e:
+        logging.warning(f"[{tile_id}] Segmentation failed: {e}")
+        return TileOutcome(tile_id=tile_id, status="seg_failed", detail=str(e))
 
-    except Exception as e:
-        return {"tile_id": tile_id, "status": f"error: {e}", "outputs": {}}
+    return TileOutcome(
+        tile_id=tile_id,
+        status="ok",
+        paths={"segmentation_xyz": seg.segmentation_xyz, "tree_hulls": seg.tree_hulls},
+    )
 
 
 # ---------------------------------------------------------------------
@@ -79,12 +85,13 @@ def main():
     logging.info(f"Overwrite: {args.overwrite}")
 
     # Locate tiles
-    tiles_root = cfg["data_root"] / case / "tiles"
+    layout = CaseLayout.from_config(cfg)
+    tiles_root = layout.tiles_dir
     if not tiles_root.exists():
         logging.error(f"Tiles directory not found: {tiles_root}")
         return
 
-    tile_dirs = sorted([p for p in tiles_root.iterdir() if (p / "clipped.laz").exists()])
+    tile_dirs = sorted([p for p in tiles_root.iterdir() if TileLayout(p).clipped_laz.exists()])
     if not tile_dirs:
         logging.info("No clipped tiles found — nothing to process.")
         return
@@ -110,14 +117,14 @@ def main():
                 tid = futures[fut]
                 try:
                     result = fut.result()
-                    logging.info(f"[{tid}] {result['status'].upper()}")
+                    logging.info(f"[{tid}] {result.status.upper()}")
                 except Exception as e:
                     logging.warning(f"[{tid}] Exception: {e}")
     else:
         logging.info("Running in serial mode.")
         for td in tile_dirs:
             result = process_tile(td, args.overwrite)
-            logging.info(f"[{td.name}] {result['status'].upper()}")
+            logging.info(f"[{td.name}] {result.status.upper()}")
 
     logging.info("=" * 80)
     logging.info("STEP 3: Forest ID Generalization")
@@ -127,11 +134,11 @@ def main():
     # Step 3: Forest generalization
     # ------------------------------------------------------------------
     try:
-        out_forest_hulls = cfg["data_root"] / case / "forest_hulls.geojson"
-        out_gtid_map = cfg["data_root"] / case / "gtid_map.csv"
+        out_forest_hulls = layout.forest_hulls
+        out_gtid_map = layout.gtid_map
 
         # Check per-tile forest.laz presence
-        missing_forest_tiles = [td.name for td in tile_dirs if not (td / "forest.laz").exists()]
+        missing_forest_tiles = [td.name for td in tile_dirs if not TileLayout(td).forest_laz.exists()]
 
         # Skip only if case-level outputs exist AND all tiles already have forest.laz
         if out_forest_hulls.exists() and out_gtid_map.exists() and not missing_forest_tiles and not args.overwrite:
@@ -147,22 +154,17 @@ def main():
                 )
             logging.info("Starting forest ID generalization...")
             result_generalize = generalize_forest_ids(case, overwrite=args.overwrite)
+            logging.info(
+                "Forest generalization complete: %s trees → %s / %s",
+                result_generalize.n_trees,
+                result_generalize.forest_hulls,
+                result_generalize.gtid_map,
+            )
 
-            if result_generalize.get("status") == "ok":
-                logging.info(
-                    "Forest generalization complete: %s trees → %s / %s",
-                    result_generalize["n_trees"],
-                    result_generalize["outputs"]["forest_hulls"],
-                    result_generalize["outputs"]["gtid_map"],
-                )
-            else:
-                logging.warning(
-                    "Forest generalization returned status: %s",
-                    result_generalize.get("status"),
-                )
-
-    except Exception as e:
+    except StageError as e:
         logging.error(f"Forest generalization failed: {e}")
+    except Exception as e:
+        logging.exception(f"Forest generalization unexpected error: {e}")
 
     logging.info("=" * 80)
     logging.info(f"Completed tree segmentation pipeline for case: {case}")

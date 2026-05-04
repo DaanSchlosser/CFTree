@@ -12,6 +12,8 @@ from pathlib import Path
 import pdal
 
 from src.config import get_config
+from src.stages import DtmResult, MissingPrerequisiteError, StageFailureError
+from src.tile_layout import TileLayout
 
 
 def compute_tile_dtm(
@@ -21,14 +23,28 @@ def compute_tile_dtm(
     rigidness: int = 3,
     iterations: int = 500,
     ground_only: bool = True,
-) -> Path:
-    """Compute DTM from a clipped .laz file using PDAL CSF + GDAL writer."""
+    overwrite: bool = False,
+) -> DtmResult:
+    """Compute DTM from a clipped .laz file using PDAL CSF + GDAL writer.
+
+    Raises
+    ------
+    MissingPrerequisiteError
+        `clipped_las` is not on disk.
+    StageFailureError
+        PDAL pipeline failed at runtime.
+    """
+    if not clipped_las.exists():
+        raise MissingPrerequisiteError(f"Input clipped LAS not found: {clipped_las}")
+
+    if dtm_out.exists() and not overwrite:
+        logging.debug(f"DTM already exists at {dtm_out} — skipped.")
+        return DtmResult(dtm=dtm_out, did_work=False)
 
     cfg = get_config()
     crs = cfg["crs"]
 
-    # Build PDAL pipeline dynamically
-    pipeline_def = [
+    pipeline_def: list = [
         str(clipped_las),
         {
             "type": "filters.csf",
@@ -39,12 +55,7 @@ def compute_tile_dtm(
     ]
 
     if ground_only:
-        pipeline_def.append(
-            {
-                "type": "filters.range",
-                "limits": "Classification[2:2]",
-            }
-        )
+        pipeline_def.append({"type": "filters.range", "limits": "Classification[2:2]"})
 
     pipeline_def.append(
         {
@@ -57,21 +68,18 @@ def compute_tile_dtm(
         }
     )
 
-    # Run pipeline
     logging.debug(f"Running PDAL DTM pipeline on {clipped_las}")
     pipeline = pdal.Pipeline(json.dumps(pipeline_def))
     try:
         pipeline.execute()
-        logging.info(f"DTM written to {dtm_out}")
     except RuntimeError as e:
-        logging.error(f"PDAL pipeline failed for {clipped_las}: {e}")
-        raise
+        raise StageFailureError(f"PDAL pipeline failed for {clipped_las}: {e}") from e
 
-    return dtm_out
+    logging.info(f"DTM written to {dtm_out}")
+    return DtmResult(dtm=dtm_out, did_work=True)
 
 
 # For manual test:
 if __name__ == "__main__":
-    compute_tile_dtm(
-        Path("data/wippolder/tiles/37EN2_11/clipped.laz"), Path("data/wippolder/tiles/37EN2_11/clipped_dtm.tif")
-    )
+    tile = TileLayout(Path("data/wippolder/tiles/37EN2_11"))
+    compute_tile_dtm(tile.clipped_laz, tile.dtm)

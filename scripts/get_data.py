@@ -24,6 +24,8 @@ from src.get_data.clip_tile import clip_tile
 from src.get_data.download_geotiles import download_tile
 from src.get_data.extract_dtm import compute_tile_dtm
 from src.get_data.tile_sources import TileSource, from_version
+from src.stages import MissingPrerequisiteError, RemoteUnavailableError, StageError, TileOutcome
+from src.tile_layout import CaseLayout
 
 
 # ---------------------------------------------------------------------
@@ -35,62 +37,48 @@ def process_tile(
     source: TileSource,
     overwrite: bool,
     aoi_path: Path,
-) -> dict:
-    """Download, clip, and compute DTM for one tile."""
+) -> TileOutcome:
+    """Download, clip, and compute DTM for one tile.
+
+    Catches `StageError` subclasses to map them to a single `TileOutcome` row
+    for the summary log; never re-raises (keeps the pool moving).
+    """
     try:
-        # ---------------------------
-        # 1. Download raw tile
-        # ---------------------------
-        result_dl = download_tile(tile_id, output_dir, source, overwrite=overwrite)
-        laz_path = result_dl.get("paths", {}).get("laz")
+        dl = download_tile(tile_id, output_dir, source, overwrite=overwrite)
+    except RemoteUnavailableError as e:
+        logging.info(f"[{tile_id}] Skipped: {e}")
+        return TileOutcome(tile_id=tile_id, status="not_in_coverage", detail=str(e))
+    except StageError as e:
+        logging.warning(f"[{tile_id}] Download failed: {e}")
+        return TileOutcome(tile_id=tile_id, status="download_failed", detail=str(e))
 
-        if result_dl["status"] != "ok" or not laz_path or not Path(laz_path).exists():
-            return {"tile_id": tile_id, "status": result_dl.get("status", "download_failed")}
+    try:
+        clip = clip_tile(dl.laz, aoi_path, overwrite=overwrite)
+    except MissingPrerequisiteError as e:
+        logging.error(f"[{tile_id}] Clip prerequisite missing: {e}")
+        return TileOutcome(tile_id=tile_id, status="clip_prereq_missing", detail=str(e))
+    except StageError as e:
+        logging.warning(f"[{tile_id}] Clip failed: {e}")
+        return TileOutcome(tile_id=tile_id, status="clip_failed", detail=str(e))
 
-        # ---------------------------
-        # 2. Clip tile to AOI
-        # ---------------------------
-        result_clip = clip_tile(Path(laz_path), aoi_path, overwrite=overwrite)
-        if result_clip["status"] != "ok":
-            return {"tile_id": tile_id, "status": result_clip["status"]}
+    dtm_out = clip.clipped.parent / "clipped_dtm.tif"
+    try:
+        logging.info(f"[{tile_id}] Computing DTM from clipped tile...")
+        dtm = compute_tile_dtm(clip.clipped, dtm_out, ground_only=True, overwrite=overwrite)
+    except StageError as e:
+        logging.warning(f"[{tile_id}] DTM generation failed: {e}")
+        return TileOutcome(
+            tile_id=tile_id,
+            status="dtm_failed",
+            paths={"raw": dl.laz, "clipped": clip.clipped},
+            detail=str(e),
+        )
 
-        clipped_path = result_clip.get("paths", {}).get("clipped")
-        if not clipped_path or not Path(clipped_path).exists():
-            logging.warning(f"[{tile_id}] Clipped tile missing — skipping DTM generation.")
-            return {"tile_id": tile_id, "status": "clip_failed"}
-
-        # ---------------------------
-        # 3. Compute DTM
-        # ---------------------------
-        dtm_path = Path(clipped_path).with_name("clipped_dtm.tif")
-        if not dtm_path.exists() or overwrite:
-            try:
-                logging.info(f"[{tile_id}] Computing DTM from clipped tile...")
-                compute_tile_dtm(Path(clipped_path), dtm_path, ground_only=True)
-                status = "ok"
-            except Exception as e:
-                logging.warning(f"[{tile_id}] DTM generation failed: {e}")
-                status = "dtm_failed"
-        else:
-            logging.debug(f"[{tile_id}] DTM already exists — skipped.")
-            status = "ok"
-
-        # ---------------------------
-        # 4. Return tile summary
-        # ---------------------------
-        return {
-            "tile_id": tile_id,
-            "status": status,
-            "paths": {
-                "raw": str(laz_path),
-                "clipped": str(clipped_path),
-                "dtm": str(dtm_path),
-            },
-        }
-
-    except Exception as e:
-        logging.exception(f"[{tile_id}] Unexpected error: {e}")
-        return {"tile_id": tile_id, "status": f"error: {e}"}
+    return TileOutcome(
+        tile_id=tile_id,
+        status="ok",
+        paths={"raw": dl.laz, "clipped": clip.clipped, "dtm": dtm.dtm},
+    )
 
 
 # ---------------------------------------------------------------------
@@ -125,8 +113,9 @@ def main():
     logging.info(f"Buffer distance: {args.buffer} m")
     logging.info(f"AHN release: AHN{args.ahn_version}")
 
-    aoi_path = cfg["case_path"] / "case_area.geojson"
-    buffered_aoi_path = cfg["case_path"] / "case_area_buffered.geojson"
+    layout = CaseLayout.from_config(cfg)
+    aoi_path = layout.aoi
+    buffered_aoi_path = layout.buffered_aoi
     resources_dir = cfg["resources_dir"]
     output_dir = cfg["data_case_path"]
 
@@ -174,14 +163,14 @@ def main():
                 tid = futures[f]
                 try:
                     result = f.result()
-                    logging.info(f"[{tid}] {result['status'].upper()}")
+                    logging.info(f"[{tid}] {result.status.upper()}")
                 except Exception as e:
                     logging.warning(f"[{tid}] Exception: {e}")
     else:
         logging.info("Running serial mode.")
         for tid in tile_ids:
             result = process_tile(tid, output_dir, source, args.overwrite, buffered_aoi_path)
-            logging.info(f"[{tid}] {result['status'].upper()}")
+            logging.info(f"[{tid}] {result.status.upper()}")
 
     logging.info(f"Completed get_data for case: {case}")
 

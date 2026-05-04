@@ -4,8 +4,7 @@
 
 # src/reconstruction/alpha_wrap_tree.py
 
-"""
-Python interface for per-tree alpha wrapping using the CGAL CLI binary.
+"""Python interface for per-tree alpha wrapping using the CGAL CLI binary.
 
 Wraps: src/reconstruction/AlphaWrap/build/awrap_points
 
@@ -14,13 +13,6 @@ Reads:
 
 Writes:
     <cache_dir>/tree_<gtid>.ply   # temporary geometry (deleted later)
-
-Returns:
-    {
-        "gtid": str,
-        "status": "ok" | "failed" | "missing_input" | "missing_binary",
-        "outputs": {"mesh_ply": Path}
-    }
 """
 
 from __future__ import annotations
@@ -28,6 +20,9 @@ from __future__ import annotations
 import logging
 import subprocess
 from pathlib import Path
+
+from src.stages import AlphaWrapResult, MissingPrerequisiteError, StageFailureError
+from src.tile_layout import TileCacheLayout
 
 
 def alpha_wrap_tree(
@@ -37,9 +32,8 @@ def alpha_wrap_tree(
     roffset: float = 50.0,
     binary_path: Path | None = None,
     overwrite: bool = False,
-) -> dict:
-    """
-    Run CGAL alpha wrapping on a single tree point cloud.
+) -> AlphaWrapResult:
+    """Run CGAL alpha wrapping on a single tree point cloud.
 
     Parameters
     ----------
@@ -55,34 +49,34 @@ def alpha_wrap_tree(
         Path to compiled awrap_points binary.
     overwrite : bool, default=False
         If True, re-run even if output already exists.
+
+    Raises
+    ------
+    MissingPrerequisiteError
+        Input .xyz or compiled binary not on disk.
+    StageFailureError
+        CGAL binary returned non-zero or crashed.
     """
     gtid = tree_xyz.stem.split("_")[-1]
-    mesh_ply = cache_dir / f"tree_{gtid}.ply"
+    mesh_ply = TileCacheLayout(cache_dir).tree_ply(int(gtid))
     binary_path = binary_path or Path(__file__).parent / "AlphaWrap" / "build" / "awrap_points"
 
-    # Pre-checks
     if not tree_xyz.exists():
-        logging.warning(f"[GTID {gtid}] Missing input file: {tree_xyz}")
-        return {"gtid": gtid, "status": "missing_input", "outputs": {}}
-
+        raise MissingPrerequisiteError(f"[GTID {gtid}] Missing input file: {tree_xyz}")
     if not binary_path.exists():
-        logging.error(f"[GTID {gtid}] Missing alpha wrap binary: {binary_path}")
-        return {"gtid": gtid, "status": "missing_binary", "outputs": {}}
+        raise MissingPrerequisiteError(f"[GTID {gtid}] Missing alpha wrap binary: {binary_path}")
 
     if mesh_ply.exists() and not overwrite:
         logging.debug(f"[GTID {gtid}] Existing mesh found, skipping.")
-        return {"gtid": gtid, "status": "skipped", "outputs": {"mesh_ply": mesh_ply}}
+        return AlphaWrapResult(mesh_ply=mesh_ply, did_work=False)
 
-    # Run binary
     cmd = [str(binary_path), str(tree_xyz), str(ralpha), str(roffset), str(mesh_ply)]
-
     try:
         subprocess.run(cmd, check=True, capture_output=True)
-        logging.debug(f"[GTID {gtid}] Alpha wrap complete -> {mesh_ply.name}")
-        return {"gtid": gtid, "status": "ok", "outputs": {"mesh_ply": mesh_ply}}
     except subprocess.CalledProcessError as e:
-        logging.warning(f"[GTID {gtid}] Alpha wrapping failed: {e.stderr.decode(errors='ignore')}")
-        return {"gtid": gtid, "status": "failed", "outputs": {}}
+        raise StageFailureError(f"[GTID {gtid}] Alpha wrapping failed: {e.stderr.decode(errors='ignore')}") from e
     except Exception as e:
-        logging.error(f"[GTID {gtid}] Unexpected error: {e}")
-        return {"gtid": gtid, "status": "failed", "outputs": {}}
+        raise StageFailureError(f"[GTID {gtid}] Alpha wrapping unexpected error: {e}") from e
+
+    logging.debug(f"[GTID {gtid}] Alpha wrap complete -> {mesh_ply.name}")
+    return AlphaWrapResult(mesh_ply=mesh_ply, did_work=True)

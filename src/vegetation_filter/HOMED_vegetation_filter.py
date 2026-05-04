@@ -12,13 +12,6 @@ Reads:
 Writes:
     data/<case>/tiles/<tile_id>/vegetation.laz
     data/<case>/tiles/<tile_id>/vegetation.xyz
-
-Returns:
-    {
-        "tile_id": str,
-        "status": "ok" | "skipped" | "failed",
-        "output": Path | None,
-    }
 """
 
 from __future__ import annotations
@@ -32,6 +25,9 @@ import laspy
 import numpy as np
 from scipy import ndimage as ndi
 from scipy.spatial import cKDTree
+
+from src.stages import MissingPrerequisiteError, StageFailureError, VegetationResult
+from src.tile_layout import TileLayout
 
 # ---------------------------------------------------------------------
 # Tunable parameters
@@ -174,25 +170,28 @@ def points_inside_dilated_mask(
 # ---------------------------------------------------------------------
 # Main per-tile entry point (pipeline API)
 # ---------------------------------------------------------------------
-def filter_tile(tile_dir: Path, overwrite: bool = False) -> dict:
-    """
-    Run HOMED vegetation filter for one tile directory.
+def filter_tile(tile_dir: Path, overwrite: bool = False) -> VegetationResult:
+    """Run HOMED vegetation filter for one tile directory.
 
-    Returns:
-        {"tile_id": str, "status": "ok"|"skipped"|"failed", "output": Path|None}
+    Raises
+    ------
+    MissingPrerequisiteError
+        Required `clipped.laz` is not on disk.
+    StageFailureError
+        Filter raised at runtime (LAS missing required dimensions, write failure, etc.).
     """
-    tile_id = tile_dir.name
-    input_path = tile_dir / "clipped.laz"
-    out_laz = tile_dir / "vegetation.laz"
-    out_xyz = tile_dir / "vegetation.xyz"
+    tile = TileLayout(tile_dir)
+    tile_id = tile.tile_id
+    input_path = tile.clipped_laz
+    out_laz = tile.vegetation_laz
+    out_xyz = tile.vegetation_xyz
 
-    if out_laz.exists() and not overwrite:
+    if out_laz.exists() and out_xyz.exists() and not overwrite:
         logging.info(f"[{tile_id}] Skipping existing vegetation.laz (use --overwrite to redo)")
-        return {"tile_id": tile_id, "status": "skipped", "output": out_laz}
+        return VegetationResult(vegetation_laz=out_laz, vegetation_xyz=out_xyz, did_work=False)
 
     if not input_path.exists():
-        logging.warning(f"[{tile_id}] Missing input clipped.laz")
-        return {"tile_id": tile_id, "status": "missing_input", "output": None}
+        raise MissingPrerequisiteError(f"[{tile_id}] Missing input clipped.laz at {input_path}")
 
     t0 = time.perf_counter()
     try:
@@ -266,8 +265,7 @@ def filter_tile(tile_dir: Path, overwrite: bool = False) -> dict:
         kept = int(m_final.sum())
         dt = time.perf_counter() - t0
         logging.info(f"[{tile_id}] Filtered vegetation: {kept:,} pts ({dt:.1f}s)")
-        return {"tile_id": tile_id, "status": "ok", "output": out_laz}
+        return VegetationResult(vegetation_laz=out_laz, vegetation_xyz=out_xyz, did_work=True)
 
     except Exception as e:
-        logging.warning(f"[{tile_id}] Vegetation filter failed: {e}")
-        return {"tile_id": tile_id, "status": "failed", "output": None}
+        raise StageFailureError(f"[{tile_id}] Vegetation filter failed: {e}") from e

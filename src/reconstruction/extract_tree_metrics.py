@@ -3,27 +3,16 @@
 # See the LICENSE file for more details.
 
 # src/reconstruction/extract_tree_metrics.py
-"""
-Compute all per-tree geometric and allometric metrics.
+"""Compute all per-tree geometric and allometric metrics.
 
 Inputs:
     - crown_mesh : trimesh.Trimesh (alpha-wrapped tree crown)
     - pts_xyz    : np.ndarray (N,3) vegetation points of this tree
     - dtm_path   : Path to DTM GeoTIFF for the tile
 
-Outputs:
-    dict with metrics, e.g.:
-    {
-        "CW_m": float,
-        "crown_median_z": float,
-        "H_m": float,
-        "DBH_m": float,
-        "r_trunk": float,
-        "porosity": float,
-        "r50_m": float,
-        "trunk_base": [x, y, z] | None,
-        "status": "ok" | "failed"
-    }
+Returns a `TreeMetrics` dataclass. Undefined sub-metrics are encoded as `NaN`
+(or `(NaN, NaN, NaN)` for `trunk_base_xyz`) — callers downstream filter on
+`np.isfinite(...)`. Hard failures raise `StageFailureError`.
 """
 
 from __future__ import annotations
@@ -38,6 +27,8 @@ import trimesh
 from rasterio import mask
 from scipy.spatial import ConvexHull, cKDTree
 from shapely.geometry import Polygon
+
+from src.stages import StageFailureError, TreeMetrics
 
 
 # ---------------------------------------------------------------------
@@ -253,58 +244,47 @@ def compute_tree_metrics(
     pts_xyz: np.ndarray,
     dtm_path: Path,
     offset: np.ndarray | list[float] | tuple[float, float, float],
-) -> dict:
-    """
-    Compute all metrics for a single reconstructed tree.
-    Returns nested dict grouping crown and trunk metrics in global CRS.
+) -> TreeMetrics:
+    """Compute all metrics for a single reconstructed tree, in global RD CRS.
+
+    Sub-metrics that cannot be defined for this tree (e.g. degenerate hull,
+    no DTM under crown) are returned as NaN; callers decide how to react.
+
+    Raises
+    ------
+    StageFailureError
+        Top-level extraction crashed (numpy / rasterio / etc. blew up).
     """
     try:
-        # --- Compute crown metrics in local coordinates ---
         CW_local, crown_median_z_local = _compute_crown_metrics(crown_mesh)
-
-        # Convert to global (add Z offset only)
         CW_m = CW_local
         crown_median_z = crown_median_z_local + offset[2]
-
-        logging.debug(f"Crown metrics (local): CW={CW_local:.3f}, median_z_local={crown_median_z_local:.3f}")
         logging.debug(f"Crown metrics (global): CW={CW_m:.3f}, median_z={crown_median_z:.3f}")
 
-        # --- Estimate trunk base (global) ---
-        logging.debug("========== Estimating trunk base from DTM...")
         trunk_base = compute_trunk_base_from_dtm(crown_mesh, dtm_path, offset)
         logging.debug(f"Trunk base (global): {trunk_base}")
 
-        # --- Compute trunk dimensions ---
-        logging.debug("========== Estimating trunk dimensions...")
         H_m, DBH_m, r_trunk = estimate_trunk_dimensions(
             CW_m, crown_median_z, trunk_base[2] if trunk_base is not None else np.nan
         )
         logging.debug(f"Trunk dimensions: H={H_m:.3f}, DBH={DBH_m:.3f}, r_trunk={r_trunk:.3f}")
 
-        # --- Compute r50 and porosity ---
-        logging.debug("========== Computing r50 and porosity...")
         r50_m = _compute_r50(crown_mesh, pts_xyz)
-        voxel_size = r50_m * 0.8
+        voxel_size = r50_m * 0.8 if np.isfinite(r50_m) and r50_m > 0 else 0.25
         porosity = _compute_porosity(crown_mesh, pts_xyz, voxel_size=voxel_size)
         logging.debug(f"r50={r50_m:.3f}, porosity={porosity:.3f}")
 
-        # --- Return only global metrics ---
-        return {
-            "crown": {
-                "CW_m": CW_m,
-                "median_z": crown_median_z,
-                "porosity": porosity,
-                "r50_m": r50_m,
-            },
-            "trunk": {
-                "H_m": H_m,
-                "DBH_m": DBH_m,
-                "r_trunk": r_trunk,
-                "base_xyz": (trunk_base.tolist() if trunk_base is not None else [np.nan, np.nan, np.nan]),
-            },
-            "status": "ok",
-        }
+        base_xyz = tuple(trunk_base.tolist()) if trunk_base is not None else (np.nan, np.nan, np.nan)
+        return TreeMetrics(
+            crown_width_m=float(CW_m),
+            crown_median_z=float(crown_median_z),
+            porosity=float(porosity),
+            r50_m=float(r50_m),
+            height_m=float(H_m),
+            dbh_m=float(DBH_m),
+            trunk_radius_m=float(r_trunk),
+            trunk_base_xyz=base_xyz,
+        )
 
     except Exception as e:
-        logging.error(f"Tree metric extraction failed: {e}")
-        return {"status": "failed"}
+        raise StageFailureError(f"Tree metric extraction failed: {e}") from e

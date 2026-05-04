@@ -8,69 +8,49 @@ import logging
 import subprocess
 from pathlib import Path
 
+from src.stages import ClipResult, MissingPrerequisiteError, StageFailureError
+from src.tile_layout import TileLayout
 
-def clip_tile(laz_path: Path, aoi_path: Path, output_dir: Path | None = None, overwrite: bool = False) -> dict:
+
+def clip_tile(laz_path: Path, aoi_path: Path, output_dir: Path | None = None, overwrite: bool = False) -> ClipResult:
+    """Clip a single LAZ file using PDAL through the robust bash script.
+
+    Raises
+    ------
+    MissingPrerequisiteError
+        Input LAZ, AOI file, or the bash script is not on disk.
+    StageFailureError
+        PDAL ran but did not produce the expected output.
     """
-    Clip a single LAZ file using PDAL through the robust bash script.
-
-    Returns
-    -------
-    dict
-        {
-            "tile_id": str,
-            "status": "ok" | "failed" | "missing_input" | "missing_aoi" | "missing_script",
-            "paths": {"clipped": Path | None}
-        }
-    """
-
     script_path = Path(__file__).parent / "tiles_clipper_robust.sh"
     tile_id = laz_path.parent.name
     output_dir = output_dir or laz_path.parent
-    clipped_path = output_dir / "clipped.laz"
+    clipped_path = TileLayout(output_dir).clipped_laz
 
-    # --- Validate prerequisites ---
     if not script_path.exists():
-        logging.error(f"[{tile_id}] Clipping script not found: {script_path}")
-        return {"tile_id": tile_id, "status": "missing_script", "paths": {"clipped": None}}
-
+        raise MissingPrerequisiteError(f"[{tile_id}] Clipping script not found: {script_path}")
     if not laz_path.exists():
-        logging.error(f"[{tile_id}] Input LAZ not found: {laz_path}")
-        return {"tile_id": tile_id, "status": "missing_input", "paths": {"clipped": None}}
-
+        raise MissingPrerequisiteError(f"[{tile_id}] Input LAZ not found: {laz_path}")
     if not aoi_path.exists():
-        logging.error(f"[{tile_id}] AOI file not found: {aoi_path}")
-        return {"tile_id": tile_id, "status": "missing_aoi", "paths": {"clipped": None}}
+        raise MissingPrerequisiteError(f"[{tile_id}] AOI file not found: {aoi_path}")
 
-    # --- Skip existing clipped tile ---
     if clipped_path.exists() and not overwrite:
         logging.info(f"[{tile_id}] Skipping existing clipped tile")
-        return {"tile_id": tile_id, "status": "ok", "paths": {"clipped": clipped_path}}
+        return ClipResult(clipped=clipped_path, did_work=False)
 
-    # --- Run clipping ---
     logging.info(f"[{tile_id}] Clipping raw tile → {clipped_path.name}")
     try:
         subprocess.run(
-            [
-                "bash",
-                str(script_path),
-                str(laz_path),
-                str(aoi_path),
-                str(clipped_path),
-            ],
+            ["bash", str(script_path), str(laz_path), str(aoi_path), str(clipped_path)],
             check=True,
             capture_output=True,
         )
-        if clipped_path.exists():
-            logging.info(f"[{tile_id}] Clipped successfully → {clipped_path}")
-            return {"tile_id": tile_id, "status": "ok", "paths": {"clipped": clipped_path}}
-        logging.warning(f"[{tile_id}] Clipping completed but file missing: {clipped_path}")
-        return {"tile_id": tile_id, "status": "failed", "paths": {"clipped": None}}
-
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.decode(errors="ignore").strip()
-        logging.warning(f"[{tile_id}] Clipping failed: {stderr}")
-        return {"tile_id": tile_id, "status": "failed", "paths": {"clipped": None}}
+        raise StageFailureError(f"[{tile_id}] Clipping failed: {stderr}") from e
 
-    except Exception as e:
-        logging.exception(f"[{tile_id}] Unexpected clipping error: {e}")
-        return {"tile_id": tile_id, "status": f"error: {e}", "paths": {"clipped": None}}
+    if not clipped_path.exists():
+        raise StageFailureError(f"[{tile_id}] Clipping completed but file missing: {clipped_path}")
+
+    logging.info(f"[{tile_id}] Clipped successfully → {clipped_path}")
+    return ClipResult(clipped=clipped_path, did_work=True)

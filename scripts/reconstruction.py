@@ -59,6 +59,8 @@ from src.reconstruction.alpha_wrap_tree import alpha_wrap_tree
 from src.reconstruction.construct_geometry import construct_lod3
 from src.reconstruction.extract_tree_metrics import compute_tree_metrics
 from src.reconstruction.write_cityjson import add_tree, finalize_cityjson, init_cityjson
+from src.stages import StageError
+from src.tile_layout import CaseLayout, TileCacheLayout, TileLayout
 
 # ---------------------------------------------------------------------
 # Tunables
@@ -141,8 +143,8 @@ def _append_durable(path: Path, line: str) -> None:
         os.fsync(f.fileno())
 
 
-def _save_tree_pkl(trees_dir: Path, gtid: int, components, offset, attributes) -> None:
-    final = trees_dir / f"{gtid}.pkl"
+def _save_tree_pkl(cache: TileCacheLayout, gtid: int, components, offset, attributes) -> None:
+    final = cache.tree_pkl(gtid)
     tmp = final.with_suffix(".pkl.tmp")
     with open(tmp, "wb") as f:
         pickle.dump(
@@ -193,32 +195,26 @@ def process_chunk(
     )
     _warmup_once()
 
-    tile_id = tile_dir.name
-    cache_dir = tile_dir / "_cache"
-    trees_dir = cache_dir / "trees"
-    in_flight_path = cache_dir / "in_flight.txt"
-    skipped_path = cache_dir / "skipped.txt"
+    tile = TileLayout(tile_dir)
+    tile_id = tile.tile_id
+    cache = tile.cache
 
-    forest_path = tile_dir / "forest.laz"
-    dtm_path = tile_dir / "clipped_dtm.tif"
-    cityjson_path = tile_dir / "trees_lod3.city.json"
-
-    if not forest_path.exists() or not dtm_path.exists():
+    if not tile.forest_laz.exists() or not tile.dtm.exists():
         result_q.put({"tile_id": tile_id, "status": "missing_input"})
         return
 
-    if cityjson_path.exists() and not overwrite:
+    if tile.cityjson.exists() and not overwrite:
         result_q.put({"tile_id": tile_id, "status": "exists"})
         return
 
-    if overwrite and cache_dir.exists():
-        shutil.rmtree(cache_dir)
-    trees_dir.mkdir(parents=True, exist_ok=True)
+    if overwrite and cache.root.exists():
+        shutil.rmtree(cache.root)
+    cache.trees_dir.mkdir(parents=True, exist_ok=True)
 
-    completed = {int(p.stem) for p in trees_dir.glob("*.pkl")}
-    skipped = _read_int_set(skipped_path)
+    completed = {int(p.stem) for p in cache.trees_dir.glob("*.pkl")}
+    skipped = _read_int_set(cache.skipped)
 
-    with laspy.open(forest_path) as lf:
+    with laspy.open(tile.forest_laz) as lf:
         las = lf.read()
     if "gtid" not in las.point_format.dimension_names:
         result_q.put({"tile_id": tile_id, "status": "invalid_input"})
@@ -276,54 +272,57 @@ def process_chunk(
         # Mark in-flight BEFORE doing the work, durable across SIGKILL.
         # If the worker dies after this point, the orchestrator reads this
         # file to identify the gtid that caused the crash.
-        _write_atomic(in_flight_path, str(gid))
+        _write_atomic(cache.in_flight, str(gid))
 
         pts = np.c_[las.x[idxs], las.y[idxs], las.z[idxs]]
         offset = pts.mean(axis=0)
         local_pts = pts - offset
 
-        xyz_path = cache_dir / f"tree_{gid}.xyz"
+        xyz_path = cache.tree_xyz(gid)
         np.savetxt(xyz_path, local_pts, fmt="%.6f")
 
-        res_alpha = alpha_wrap_tree(xyz_path, cache_dir, overwrite=False)
-        if res_alpha["status"] not in ("ok", "skipped"):
-            logging.warning(f"[{tile_id}] GTID {gid}: alpha wrap failed ({res_alpha['status']})")
-            in_flight_path.unlink(missing_ok=True)
+        try:
+            res_alpha = alpha_wrap_tree(xyz_path, cache.root, overwrite=False)
+        except StageError as e:
+            logging.warning(f"[{tile_id}] GTID {gid}: alpha wrap failed ({e})")
+            cache.in_flight.unlink(missing_ok=True)
             continue
 
         try:
-            mesh = load_mesh(res_alpha["outputs"]["mesh_ply"])
+            mesh = load_mesh(res_alpha.mesh_ply)
         except Exception as e:
             logging.warning(f"[{tile_id}] GTID {gid}: mesh load failed ({e})")
-            in_flight_path.unlink(missing_ok=True)
+            cache.in_flight.unlink(missing_ok=True)
             continue
 
-        metrics = compute_tree_metrics(mesh, local_pts, dtm_path, offset)
-        if metrics["status"] != "ok":
+        try:
+            metrics = compute_tree_metrics(mesh, local_pts, tile.dtm, offset)
+        except StageError as e:
+            logging.warning(f"[{tile_id}] GTID {gid}: metrics failed ({e})")
             del mesh, local_pts
-            in_flight_path.unlink(missing_ok=True)
+            cache.in_flight.unlink(missing_ok=True)
             continue
 
         tree_geom = construct_lod3(mesh, metrics, offset, gtid=gid, tile_id=tile_id)
-        if not tree_geom["components"]:
+        if not tree_geom.components:
             del mesh, local_pts, res_alpha
-            in_flight_path.unlink(missing_ok=True)
+            cache.in_flight.unlink(missing_ok=True)
             continue
 
-        _save_tree_pkl(trees_dir, gid, tree_geom["components"], offset, tree_geom["attributes"])
+        _save_tree_pkl(cache, gid, tree_geom.components, offset, tree_geom.attributes)
         completed.add(gid)
         n_processed_this_chunk += 1
 
         # Tree fully done: clear the in-flight marker so a later crash
         # is not blamed on this gtid.
-        in_flight_path.unlink(missing_ok=True)
+        cache.in_flight.unlink(missing_ok=True)
 
         del mesh, local_pts, res_alpha, tree_geom
         gc.collect()
 
     # Assemblage of the final CityJSON.
     city = init_cityjson()
-    for pkl_path in sorted(trees_dir.glob("*.pkl"), key=lambda p: int(p.stem)):
+    for pkl_path in sorted(cache.trees_dir.glob("*.pkl"), key=lambda p: int(p.stem)):
         try:
             with open(pkl_path, "rb") as f:
                 t = pickle.load(f)
@@ -339,12 +338,12 @@ def process_chunk(
         return
 
     city_final = finalize_cityjson(city)
-    with open(cityjson_path, "w", encoding="utf-8") as f:
+    with open(tile.cityjson, "w", encoding="utf-8") as f:
         json.dump(city_final, f, indent=2)
-    logging.info(f"[{tile_id}] CityJSON written: {cityjson_path.name} ({n_objects} trees, {len(skipped)} skipped)")
+    logging.info(f"[{tile_id}] CityJSON written: {tile.cityjson.name} ({n_objects} trees, {len(skipped)} skipped)")
 
     if not keep_cache:
-        shutil.rmtree(cache_dir, ignore_errors=True)
+        shutil.rmtree(cache.root, ignore_errors=True)
 
     result_q.put(
         {
@@ -378,14 +377,11 @@ def _run_tile(
     max_trees: int | None,
     log_level: str,
 ) -> dict:
-    tile_id = tile_dir.name
-    cityjson_path = tile_dir / "trees_lod3.city.json"
-    cache_dir = tile_dir / "_cache"
-    in_flight_path = cache_dir / "in_flight.txt"
-    skipped_path = cache_dir / "skipped.txt"
-    trees_dir = cache_dir / "trees"
+    tile = TileLayout(tile_dir)
+    tile_id = tile.tile_id
+    cache = tile.cache
 
-    if cityjson_path.exists() and not overwrite:
+    if tile.cityjson.exists() and not overwrite:
         logging.info(f"[{tile_id}] CityJSON already exists — skipping")
         return {"tile_id": tile_id, "status": "exists", "chunks": 0}
 
@@ -457,8 +453,8 @@ def _run_tile(
         # Worker died. Inspect the in-flight marker to identify the likely culprit gtid, and
         # update the crash counters. If the same gtid causes _PATHOLOGY_THRESHOLD consecutive
         # crashes, mark it pathological and skip it permanently.
-        in_flight = in_flight_path.read_text().strip() if in_flight_path.exists() else ""
-        n_completed = len(list(trees_dir.glob("*.pkl"))) if trees_dir.exists() else 0
+        in_flight = cache.in_flight.read_text().strip() if cache.in_flight.exists() else ""
+        n_completed = len(list(cache.trees_dir.glob("*.pkl"))) if cache.trees_dir.exists() else 0
         reason = "timeout" if timed_out else f"exitcode={proc.exitcode}"
         consecutive_crashes += 1
 
@@ -470,9 +466,9 @@ def _run_tile(
             if bad_gtid is not None:
                 crashes_per_gtid[bad_gtid] = crashes_per_gtid.get(bad_gtid, 0) + 1
                 count = crashes_per_gtid[bad_gtid]
-                in_flight_path.unlink(missing_ok=True)
+                cache.in_flight.unlink(missing_ok=True)
                 if count >= _PATHOLOGY_THRESHOLD:
-                    _append_durable(skipped_path, str(bad_gtid))
+                    _append_durable(cache.skipped, str(bad_gtid))
                     del crashes_per_gtid[bad_gtid]
                     logging.warning(
                         f"[{tile_id}] Chunk {chunks_run} died ({reason}) on GTID {bad_gtid} "
@@ -541,7 +537,7 @@ def main():
 
     logging.info(f"Reconstruction starting: case={case}, n_cores={n_cores}, chunk_size={args.chunk_size}")
 
-    tiles_root = cfg["data_root"] / case / "tiles"
+    tiles_root = CaseLayout.from_config(cfg).tiles_dir
     if not tiles_root.exists():
         logging.error(f"No tiles found at {tiles_root}")
         return

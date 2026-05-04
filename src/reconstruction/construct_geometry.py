@@ -4,27 +4,19 @@
 
 # src/reconstruction/construct_geometry.py
 
-"""
-Construct LoD3 tree geometries (crown + trunk) in local coordinates.
+"""Construct LoD3 tree geometries (crown + trunk) in local coordinates.
 
 Both crown and trunk are represented as CityJSON "Solid" geometries.
 This module is pure: no file I/O or side effects beyond logging.
 
 Inputs:
-    - crown_mesh : trimesh.Trimesh       # alpha-wrapped crown in local coords
-    - metrics     : dict                 # from extract_tree_metrics
-    - offset_global : list[float]        # translation back to RD New
+    - crown_mesh   : trimesh.Trimesh   # alpha-wrapped crown in local coords
+    - metrics       : TreeMetrics
+    - offset_global : list[float]      # translation back to RD New
     - gtid, tile_id : optional identifiers for logging
 
-Outputs:
-    dict with:
-        {
-            "components": [
-                {"role": "crown", "lod": 3.0, "vertices_local": np.ndarray, "faces": np.ndarray},
-                {"role": "trunk", "lod": 3.0, "vertices_local": np.ndarray, "faces": np.ndarray},
-            ],
-            "attributes": OrderedDict([...])
-        }
+Returns `Lod3Result(components, attributes)` — `components` may be empty if
+neither crown nor trunk could be constructed.
 """
 
 from __future__ import annotations
@@ -34,6 +26,8 @@ from collections import OrderedDict
 
 import numpy as np
 import trimesh
+
+from src.stages import Lod3Result, TreeMetrics
 
 # ---------------------------------------------------------------------
 # Canonical attribute order (extendable later)
@@ -131,30 +125,21 @@ def _build_trunk_solid(
 # ---------------------------------------------------------------------
 # Attribute normalization
 # ---------------------------------------------------------------------
-def _normalize_attributes(metrics: dict, gtid: int, tile_id: str | None = None) -> OrderedDict:
-    """
-    Flatten and order attributes to a stable OrderedDict with None for missing.
-    """
-    crown = metrics.get("crown", {})
-    trunk = metrics.get("trunk", {})
-
-    vals = {
+def _normalize_attributes(metrics: TreeMetrics, gtid: int, tile_id: str | None = None) -> OrderedDict:
+    """Flatten metrics into the canonical CityJSON attribute order, with None for NaN."""
+    bz = metrics.trunk_base_xyz[2]
+    vals: dict[str, object] = {
         "gtid": gtid,
         "tile_id": tile_id,
-        "crown_width_m": crown.get("CW_m"),
-        "crown_median_z": crown.get("median_z"),
-        "crown_r50_m": crown.get("r50_m"),
-        "crown_porosity": crown.get("porosity"),
-        "trunk_H_m": trunk.get("H_m"),
-        "trunk_DBH_m": trunk.get("DBH_m"),
-        "trunk_radius_m": trunk.get("r_trunk"),
+        "crown_width_m": metrics.crown_width_m,
+        "crown_median_z": metrics.crown_median_z,
+        "crown_r50_m": metrics.r50_m,
+        "crown_porosity": metrics.porosity,
+        "trunk_H_m": metrics.height_m,
+        "trunk_DBH_m": metrics.dbh_m,
+        "trunk_radius_m": metrics.trunk_radius_m,
+        "trunk_base_height_m": bz,
     }
-    base = trunk.get("base_xyz")
-
-    if base is not None and len(base) == 3:
-        vals.update({"trunk_base_height_m": base[2]})
-    else:
-        vals.update({"trunk_base_height_m": None})
 
     ordered = OrderedDict()
     for k in ATTR_KEYS:
@@ -178,63 +163,54 @@ def _normalize_attributes(metrics: dict, gtid: int, tile_id: str | None = None) 
 # ---------------------------------------------------------------------
 def construct_lod3(
     crown_mesh: trimesh.Trimesh,
-    metrics: dict,
+    metrics: TreeMetrics,
     offset_global: list[float] | np.ndarray,
     gtid: int | None = None,
     tile_id: str | None = None,
-) -> dict:
-    """
-    Construct LoD3 geometries (crown + trunk) for one tree in local coordinates.
+) -> Lod3Result:
+    """Construct LoD3 components (crown + trunk) for one tree in local coordinates.
 
-    Returns dict with:
-        {"components": [ ... ], "attributes": OrderedDict([...])}
+    `Lod3Result.components` may be empty if neither crown nor trunk could be built;
+    the caller decides whether to skip the tree.
     """
     gtid_str = f"GTID {gtid}" if gtid is not None else "GTID ?"
     logging.debug(f"[{tile_id}] [{gtid_str}] Constructing LoD3 geometry...")
 
-    components = []
+    components: list[dict] = []
 
-    # --- Crown Solid (local coordinates)---
     crown_comp = _build_crown_solid(crown_mesh, gtid)
     if crown_comp is not None:
         components.append(crown_comp)
     else:
         logging.warning(f"[{tile_id}] [{gtid_str}] No valid crown component created.")
 
-    # --- Trunk Solid ---
-    try:
-        trunk_base_global = np.array(metrics["trunk"]["base_xyz"], dtype=float)
-        trunk_base_local = trunk_base_global - np.asarray(offset_global, dtype=float)
-    except Exception:
-        trunk_base_local = None
+    offset_arr = np.asarray(offset_global, dtype=float)
+    trunk_base_global = np.asarray(metrics.trunk_base_xyz, dtype=float)
+    trunk_base_local = trunk_base_global - offset_arr if np.all(np.isfinite(trunk_base_global)) else None
+    crown_median_z_local = metrics.crown_median_z - float(offset_arr[2])
 
-    crown_median_z_global = float(metrics.get("crown", {}).get("median_z", np.nan))
-    crown_median_z_local = crown_median_z_global - float(np.asarray(offset_global, dtype=float)[2])
-
-    # --- Build trunk in LOCAL coordinates ---
     trunk_comp = _build_trunk_solid(
         crown_mesh=crown_mesh,
         trunk_base=trunk_base_local,
-        r_trunk=float(metrics.get("trunk", {}).get("r_trunk", np.nan)),
+        r_trunk=metrics.trunk_radius_m,
         crown_median_z=crown_median_z_local,
         gtid=gtid,
     )
-
     if trunk_comp is not None:
         components.append(trunk_comp)
     else:
         logging.warning(f"[{tile_id}] [{gtid_str}] No valid trunk component created.")
 
-    # --- Sanity check: local coordinates shouldn't exceed ~5 000 m magnitude ---
+    # Local coordinates shouldn't exceed ~5 000 m — guards against a global-coord leak.
     for comp in components:
-        vmax = np.abs(np.asarray(comp.get("vertices_local", []))).max() if comp.get("vertices_local") is not None else 0
+        verts = comp.get("vertices_local")
+        vmax = float(np.abs(np.asarray(verts)).max()) if verts is not None and len(verts) else 0.0
         if np.isfinite(vmax) and vmax > 5000:
             logging.warning(
                 f"[Tile {tile_id} | GTID {gtid}] Suspicious local magnitude ({vmax:.1f}); "
                 f"possible global coords leaked into local component."
             )
 
-    # --- Attributes ---
     attributes = _normalize_attributes(metrics, gtid or -1, tile_id)
 
     logging.info(
@@ -243,4 +219,4 @@ def construct_lod3(
         f"Trunk={any(c['role'] == 'trunk' for c in components)})"
     )
 
-    return {"components": components, "attributes": attributes}
+    return Lod3Result(components=components, attributes=dict(attributes))
