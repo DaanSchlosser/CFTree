@@ -166,7 +166,7 @@ data/<case_name>/gtid_map.csv
 ## Performance
 | City      | # Trees | Runtime (16 cores) | Notes                       |
 | --------- | ------- | ------------------ | --------------------------- |
-| Amsterdam | ~380k   | ~13 h              | Full pipeline, AHN4 dataset |
+| Amsterdam | ~380k   | ~13 h              | Full pipeline, AHN5 dataset |
 | Rotterdam | ~210k   | ~7 h               |                             |
 | Utrecht   | ~150k   | ~5 h               |                             |
 | Delft     | ~90k    | ~3 h               |                             |
