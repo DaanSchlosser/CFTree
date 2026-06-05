@@ -8,6 +8,8 @@
 cases/*
 !cases/wippolder/
 !cases/wippolder/case_area.geojson
+!cases/emmer_compascuum/
+!cases/emmer_compascuum/case_area.geojson
 !cases/README.md
 cases/*/case_area_buffered.geojson
 cases/*/logs/
