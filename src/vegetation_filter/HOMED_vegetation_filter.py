@@ -24,6 +24,8 @@ from pathlib import Path
 import laspy
 import numpy as np
 from scipy import ndimage as ndi
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 from src.stages import MissingPrerequisiteError, StageFailureError, VegetationResult
@@ -98,30 +100,43 @@ def sor_mask_for_subset(xyz_all: np.ndarray, base_mask: np.ndarray, k: int, sigm
 def remove_small_components(
     xyz_all: np.ndarray, base_mask: np.ndarray, radius: float = 0.6, min_pts: int = 60
 ) -> np.ndarray:
+    """Keep only connected components with at least `min_pts` points.
+
+    Two points are connected when their 3D Euclidean distance is ``<= radius``.
+    This reproduces exactly the labeling the previous pure-Python BFS produced,
+    but builds the radius graph once with ``cKDTree.query_pairs`` and labels it
+    with ``connected_components`` (both C-level), instead of issuing one
+    ``query_ball_point`` per point inside a Python loop — which was O(N) Python
+    iterations and dominated filter runtime on dense tiles.
+    """
     idx = np.where(base_mask)[0]
     if idx.size == 0:
         return base_mask.copy()
-    sub = xyz_all[idx]
-    tree = cKDTree(sub)
-    visited = np.zeros(len(sub), dtype=bool)
-    keep = np.zeros_like(base_mask, dtype=bool)
 
-    for i in range(len(sub)):
-        if visited[i]:
-            continue
-        stack = [i]
-        comp = []
-        while stack:
-            j = stack.pop()
-            if visited[j]:
-                continue
-            visited[j] = True
-            comp.append(j)
-            for k in tree.query_ball_point(sub[j], r=radius):
-                if not visited[k]:
-                    stack.append(k)
-        if len(comp) >= min_pts:
-            keep[idx[np.array(comp)]] = True
+    sub = xyz_all[idx]
+    n = sub.shape[0]
+    tree = cKDTree(sub)
+    # Pairs of points within `radius` (distance <= radius, matching the old
+    # query_ball_point semantics). Returns i<j pairs, no self-pairs.
+    pairs = tree.query_pairs(radius, output_type="ndarray")
+
+    keep = np.zeros_like(base_mask, dtype=bool)
+    if pairs.shape[0] == 0:
+        # No edges: every point is its own singleton component (size 1).
+        if min_pts <= 1:
+            keep[idx] = True
+        return keep
+
+    # Upper-triangular adjacency; connected_components(directed=False) treats it
+    # as undirected, so symmetrizing is unnecessary. Edge weights are ignored.
+    graph = coo_matrix(
+        (np.ones(pairs.shape[0], dtype=np.int8), (pairs[:, 0], pairs[:, 1])),
+        shape=(n, n),
+    )
+    _, labels = connected_components(graph, directed=False, return_labels=True)
+    comp_sizes = np.bincount(labels)
+    keep_local = comp_sizes[labels] >= min_pts
+    keep[idx[keep_local]] = True
     return keep
 
 
