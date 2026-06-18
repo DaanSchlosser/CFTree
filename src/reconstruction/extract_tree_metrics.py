@@ -148,7 +148,7 @@ def _compute_r50(
 # ---------------------------------------------------------------------
 def compute_trunk_base_from_dtm(
     crown_mesh: trimesh.Trimesh,
-    dtm_path: Path,
+    dtm: Path | rasterio.io.DatasetReader,
     offset: np.ndarray | list[float] | tuple[float, float, float],
 ) -> np.ndarray | None:
     """
@@ -165,8 +165,11 @@ def compute_trunk_base_from_dtm(
     ----------
     crown_mesh : trimesh.Trimesh
         Crown mesh in local coordinates.
-    dtm_path : Path
-        Path to the clipped DTM raster (RD New CRS).
+    dtm : Path | rasterio.io.DatasetReader
+        The clipped DTM raster (RD New CRS), as a path or an already-open dataset.
+        The DTM is identical for every tree in a tile, so a worker can open it
+        once and pass the dataset here to avoid re-opening per tree; results are
+        identical either way. A path is opened and closed within this call.
     offset : np.ndarray | list | tuple
         Translation vector applied to localize the tree (same units as DTM CRS).
 
@@ -191,8 +194,11 @@ def compute_trunk_base_from_dtm(
         # --- translate to global coordinates for raster sampling (ignore z offset)
         poly_global = shapely.affinity.translate(poly_local, xoff=offset[0], yoff=offset[1])
 
-        # --- open DTM and extract values under crown
-        with rasterio.open(dtm_path) as src:
+        # --- DTM source: open a path here (and close it), or reuse a dataset the
+        #     caller already opened (one open per worker rather than per tree).
+        opened = rasterio.open(dtm) if isinstance(dtm, (str, Path)) else None
+        src = opened if opened is not None else dtm
+        try:
             out_img, out_transform = mask.mask(src, [poly_global], crop=True, filled=False)
             band = out_img[0]
             rows, cols = np.where(~band.mask)
@@ -214,6 +220,9 @@ def compute_trunk_base_from_dtm(
                 float(band.data[rows[idx], cols[idx]]),
             )
             return np.array([bx, by, bz], dtype=np.float64)
+        finally:
+            if opened is not None:
+                opened.close()
 
     except Exception as e:
         logging.warning(f"Trunk base extraction failed: {e}")
@@ -242,13 +251,20 @@ def estimate_trunk_dimensions(
 def compute_tree_metrics(
     crown_mesh: trimesh.Trimesh,
     pts_xyz: np.ndarray,
-    dtm_path: Path,
+    dtm: Path | rasterio.io.DatasetReader,
     offset: np.ndarray | list[float] | tuple[float, float, float],
+    compute_semantics: bool = True,
 ) -> TreeMetrics:
     """Compute all metrics for a single reconstructed tree, in global RD CRS.
 
     Sub-metrics that cannot be defined for this tree (e.g. degenerate hull,
     no DTM under crown) are returned as NaN; callers decide how to react.
+
+    When `compute_semantics` is False (geometry-only runs), the two expensive,
+    purely-descriptive metrics — `r50_m` and `porosity` — are skipped and
+    returned as NaN. They account for ~80% of per-tree runtime and feed no
+    geometry: crown comes from the alpha-wrap mesh and the trunk from
+    crown width / DTM / allometry, all of which are still computed here.
 
     Raises
     ------
@@ -261,7 +277,7 @@ def compute_tree_metrics(
         crown_median_z = crown_median_z_local + offset[2]
         logging.debug(f"Crown metrics (global): CW={CW_m:.3f}, median_z={crown_median_z:.3f}")
 
-        trunk_base = compute_trunk_base_from_dtm(crown_mesh, dtm_path, offset)
+        trunk_base = compute_trunk_base_from_dtm(crown_mesh, dtm, offset)
         logging.debug(f"Trunk base (global): {trunk_base}")
 
         H_m, DBH_m, r_trunk = estimate_trunk_dimensions(
@@ -269,10 +285,15 @@ def compute_tree_metrics(
         )
         logging.debug(f"Trunk dimensions: H={H_m:.3f}, DBH={DBH_m:.3f}, r_trunk={r_trunk:.3f}")
 
-        r50_m = _compute_r50(crown_mesh, pts_xyz)
-        voxel_size = r50_m * 0.8 if np.isfinite(r50_m) and r50_m > 0 else 0.25
-        porosity = _compute_porosity(crown_mesh, pts_xyz, voxel_size=voxel_size)
-        logging.debug(f"r50={r50_m:.3f}, porosity={porosity:.3f}")
+        if compute_semantics:
+            r50_m = _compute_r50(crown_mesh, pts_xyz)
+            voxel_size = r50_m * 0.8 if np.isfinite(r50_m) and r50_m > 0 else 0.25
+            porosity = _compute_porosity(crown_mesh, pts_xyz, voxel_size=voxel_size)
+            logging.debug(f"r50={r50_m:.3f}, porosity={porosity:.3f}")
+        else:
+            # Geometry-only: skip the expensive descriptive metrics entirely.
+            r50_m = np.nan
+            porosity = np.nan
 
         base_xyz = tuple(trunk_base.tolist()) if trunk_base is not None else (np.nan, np.nan, np.nan)
         return TreeMetrics(

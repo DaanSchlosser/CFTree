@@ -50,12 +50,13 @@ from pathlib import Path
 
 import laspy
 import numpy as np
+import rasterio
 import trimesh
 from scipy.spatial import cKDTree
 from trimesh import load as load_mesh
 
 from src.config import ResolvedConfig, get_config, setup_logger
-from src.reconstruction.alpha_wrap_tree import alpha_wrap_tree
+from src.reconstruction.alpha_wrap_tree import AlphaWrapServer
 from src.reconstruction.construct_geometry import construct_lod3
 from src.reconstruction.extract_tree_metrics import compute_tree_metrics
 from src.reconstruction.write_cityjson import add_tree, finalize_cityjson, init_cityjson
@@ -96,6 +97,14 @@ _MAX_CONSECUTIVE_CRASHES = 20
 # `Queue.put` from the child can race with the join() return on the parent
 # side; a short timeout closes that window without slowing the happy path.
 _QUEUE_DRAIN_TIMEOUT_S = 2.0
+
+# Run a full `gc.collect()` once every this many completed trees rather than
+# after every tree. The per-tree `del` already drops references so non-cyclic
+# objects are freed immediately; gc only reclaims reference cycles (trimesh
+# caches), and a full generational sweep per tree is pure overhead across
+# hundreds of thousands of trees. Native (embree) memory is reclaimed by
+# worker recycling, not by gc, so this does not affect the RSS ceiling.
+_GC_INTERVAL = 32
 
 
 # ---------------------------------------------------------------------
@@ -171,6 +180,7 @@ def process_chunk(
     keep_cache: bool,
     max_trees: int | None,
     result_q: mp.Queue,
+    geometry_only: bool = False,
 ) -> None:
     """Process up to `chunk_size` pending trees from a tile, then exit.
 
@@ -239,130 +249,159 @@ def process_chunk(
     boundaries = np.searchsorted(sorted_gtids, np.array(pending, dtype=gtid_arr.dtype))
     boundaries_end = np.searchsorted(sorted_gtids, np.array(pending, dtype=gtid_arr.dtype), side="right")
     gtid_indices: dict[int, np.ndarray] = {
-        gid: sort_order[start:end]
-        for gid, start, end in zip(pending, boundaries, boundaries_end, strict=True)
+        gid: sort_order[start:end] for gid, start, end in zip(pending, boundaries, boundaries_end, strict=True)
     }
 
     logging.info(
         f"[{tile_id}] Chunk start: {len(pending)} pending of {n_total} trees "
-        f"(completed={len(completed)}, skipped={len(skipped)}, chunk_size={chunk_size})"
+        f"(completed={len(completed)}, skipped={len(skipped)}, chunk_size={chunk_size}"
+        f"{', geometry-only' if geometry_only else ''})"
     )
 
-    n_processed_this_chunk = 0
-    for gid in pending:
-        if n_processed_this_chunk >= chunk_size:
-            # Hand off to the next worker; this worker exits cleanly so the
-            # OS reclaims its accumulated C-extension memory.
-            logging.info(f"[{tile_id}] Chunk budget reached ({chunk_size} trees); recycling worker")
-            result_q.put(
-                {
-                    "tile_id": tile_id,
-                    "status": "chunk_done",
-                    "n_chunk": n_processed_this_chunk,
-                    "n_completed": len(completed),
-                    "n_total": n_total,
-                }
-            )
+    # Open the tile DTM once and reuse it for every tree's trunk-base lookup,
+    # and launch one persistent alpha-wrap coprocess for the whole chunk
+    # instead of spawning the CGAL binary per tree (~10 ms launch each). Both
+    # are torn down in the `finally` below on every exit path (chunk-budget
+    # return, end-of-loop finalize, or an unexpected exception); the coprocess
+    # also exits on its own when this short-lived worker process dies, because
+    # its stdin pipe closes.
+    dtm_src = rasterio.open(tile.dtm)
+    awrap = AlphaWrapServer()
+
+    try:
+        n_processed_this_chunk = 0
+        for gid in pending:
+            if n_processed_this_chunk >= chunk_size:
+                # Hand off to the next worker; this worker exits cleanly so the
+                # OS reclaims its accumulated C-extension memory.
+                logging.info(f"[{tile_id}] Chunk budget reached ({chunk_size} trees); recycling worker")
+                result_q.put(
+                    {
+                        "tile_id": tile_id,
+                        "status": "chunk_done",
+                        "n_chunk": n_processed_this_chunk,
+                        "n_completed": len(completed),
+                        "n_total": n_total,
+                    }
+                )
+                return
+
+            idxs = gtid_indices[gid]
+            if idxs.size < _MIN_POINTS_PER_TREE:
+                continue
+
+            # Mark in-flight BEFORE doing the work, durable across SIGKILL.
+            # If the worker dies after this point, the orchestrator reads this
+            # file to identify the gtid that caused the crash.
+            _write_atomic(cache.in_flight, str(gid))
+
+            pts = np.c_[las.x[idxs], las.y[idxs], las.z[idxs]]
+            offset = pts.mean(axis=0)
+            local_pts = pts - offset
+
+            xyz_path = cache.tree_xyz(gid)
+            np.savetxt(xyz_path, local_pts, fmt="%.6f")
+
+            try:
+                res_alpha = awrap.wrap(xyz_path, cache.tree_ply(gid))
+            except StageError as e:
+                logging.warning(f"[{tile_id}] GTID {gid}: alpha wrap failed ({e})")
+                cache.in_flight.unlink(missing_ok=True)
+                continue
+
+            try:
+                mesh = load_mesh(res_alpha.mesh_ply)
+            except Exception as e:
+                logging.warning(f"[{tile_id}] GTID {gid}: mesh load failed ({e})")
+                cache.in_flight.unlink(missing_ok=True)
+                continue
+
+            try:
+                metrics = compute_tree_metrics(mesh, local_pts, dtm_src, offset, compute_semantics=not geometry_only)
+            except StageError as e:
+                logging.warning(f"[{tile_id}] GTID {gid}: metrics failed ({e})")
+                del mesh, local_pts
+                cache.in_flight.unlink(missing_ok=True)
+                continue
+
+            tree_geom = construct_lod3(mesh, metrics, offset, gtid=gid, tile_id=tile_id)
+            if not tree_geom.components:
+                del mesh, local_pts, res_alpha
+                cache.in_flight.unlink(missing_ok=True)
+                continue
+
+            _save_tree_pkl(cache, gid, tree_geom.components, offset, tree_geom.attributes)
+            completed.add(gid)
+            n_processed_this_chunk += 1
+
+            # Tree fully done: clear the in-flight marker so a later crash
+            # is not blamed on this gtid.
+            cache.in_flight.unlink(missing_ok=True)
+
+            del mesh, local_pts, res_alpha, tree_geom
+            if n_processed_this_chunk % _GC_INTERVAL == 0:
+                gc.collect()
+
+        # Assemblage of the final CityJSON. Only emit trees still present in this
+        # tile's current forest.laz: an ownership change upstream can REDUCE a
+        # tile's gtid set between runs, and a stale _cache/<gtid>.pkl from a prior
+        # run must not re-introduce a tree this tile no longer owns. (With
+        # --overwrite the cache is wiped up front; this guard makes a plain resume
+        # safe too.)
+        valid_gtids = {int(g) for g in unique_gtids}
+        city = init_cityjson()
+        for pkl_path in sorted(cache.trees_dir.glob("*.pkl"), key=lambda p: int(p.stem)):
+            if int(pkl_path.stem) not in valid_gtids:
+                continue
+            try:
+                with open(pkl_path, "rb") as f:
+                    t = pickle.load(f)
+            except Exception as e:
+                logging.warning(f"[{tile_id}] Failed to read {pkl_path.name}: {e}")
+                continue
+            add_tree(city, t["gtid"], t["components"], t["offset"], t["attributes"])
+
+        n_objects = len(city["CityObjects"])
+        if n_objects == 0:
+            logging.warning(f"[{tile_id}] No trees reconstructed — skipping CityJSON write.")
+            result_q.put({"tile_id": tile_id, "status": "empty_tile"})
             return
 
-        idxs = gtid_indices[gid]
-        if idxs.size < _MIN_POINTS_PER_TREE:
-            continue
+        city_final = finalize_cityjson(city)
+        # Compact separators: CityJSON is machine-read, and a tile holds hundreds of
+        # thousands of quantized-integer vertices. Dropping indentation whitespace
+        # both shrinks the file substantially and speeds serialization; the content
+        # is identical.
+        with open(tile.cityjson, "w", encoding="utf-8") as f:
+            json.dump(city_final, f, separators=(",", ":"))
+        logging.info(f"[{tile_id}] CityJSON written: {tile.cityjson.name} ({n_objects} trees, {len(skipped)} skipped)")
 
-        # Mark in-flight BEFORE doing the work, durable across SIGKILL.
-        # If the worker dies after this point, the orchestrator reads this
-        # file to identify the gtid that caused the crash.
-        _write_atomic(cache.in_flight, str(gid))
+        if not keep_cache:
+            shutil.rmtree(cache.root, ignore_errors=True)
 
-        pts = np.c_[las.x[idxs], las.y[idxs], las.z[idxs]]
-        offset = pts.mean(axis=0)
-        local_pts = pts - offset
-
-        xyz_path = cache.tree_xyz(gid)
-        np.savetxt(xyz_path, local_pts, fmt="%.6f")
-
-        try:
-            res_alpha = alpha_wrap_tree(xyz_path, cache.root, overwrite=False)
-        except StageError as e:
-            logging.warning(f"[{tile_id}] GTID {gid}: alpha wrap failed ({e})")
-            cache.in_flight.unlink(missing_ok=True)
-            continue
-
-        try:
-            mesh = load_mesh(res_alpha.mesh_ply)
-        except Exception as e:
-            logging.warning(f"[{tile_id}] GTID {gid}: mesh load failed ({e})")
-            cache.in_flight.unlink(missing_ok=True)
-            continue
-
-        try:
-            metrics = compute_tree_metrics(mesh, local_pts, tile.dtm, offset)
-        except StageError as e:
-            logging.warning(f"[{tile_id}] GTID {gid}: metrics failed ({e})")
-            del mesh, local_pts
-            cache.in_flight.unlink(missing_ok=True)
-            continue
-
-        tree_geom = construct_lod3(mesh, metrics, offset, gtid=gid, tile_id=tile_id)
-        if not tree_geom.components:
-            del mesh, local_pts, res_alpha
-            cache.in_flight.unlink(missing_ok=True)
-            continue
-
-        _save_tree_pkl(cache, gid, tree_geom.components, offset, tree_geom.attributes)
-        completed.add(gid)
-        n_processed_this_chunk += 1
-
-        # Tree fully done: clear the in-flight marker so a later crash
-        # is not blamed on this gtid.
-        cache.in_flight.unlink(missing_ok=True)
-
-        del mesh, local_pts, res_alpha, tree_geom
-        gc.collect()
-
-    # Assemblage of the final CityJSON.
-    city = init_cityjson()
-    for pkl_path in sorted(cache.trees_dir.glob("*.pkl"), key=lambda p: int(p.stem)):
-        try:
-            with open(pkl_path, "rb") as f:
-                t = pickle.load(f)
-        except Exception as e:
-            logging.warning(f"[{tile_id}] Failed to read {pkl_path.name}: {e}")
-            continue
-        add_tree(city, t["gtid"], t["components"], t["offset"], t["attributes"])
-
-    n_objects = len(city["CityObjects"])
-    if n_objects == 0:
-        logging.warning(f"[{tile_id}] No trees reconstructed — skipping CityJSON write.")
-        result_q.put({"tile_id": tile_id, "status": "empty_tile"})
-        return
-
-    city_final = finalize_cityjson(city)
-    with open(tile.cityjson, "w", encoding="utf-8") as f:
-        json.dump(city_final, f, indent=2)
-    logging.info(f"[{tile_id}] CityJSON written: {tile.cityjson.name} ({n_objects} trees, {len(skipped)} skipped)")
-
-    if not keep_cache:
-        shutil.rmtree(cache.root, ignore_errors=True)
-
-    result_q.put(
-        {
-            "tile_id": tile_id,
-            "status": "complete",
-            "n_trees": n_objects,
-            "n_skipped": len(skipped),
-        }
-    )
+        result_q.put(
+            {
+                "tile_id": tile_id,
+                "status": "complete",
+                "n_trees": n_objects,
+                "n_skipped": len(skipped),
+            }
+        )
+    finally:
+        awrap.close()
+        dtm_src.close()
 
 
 # ---------------------------------------------------------------------
 # Worker entry: configures logging then runs the chunk
 # ---------------------------------------------------------------------
-def _worker_entry(tile_dir, cfg, chunk_size, overwrite, keep_cache, max_trees, log_level, result_q):
+def _worker_entry(
+    tile_dir, cfg, chunk_size, overwrite, keep_cache, max_trees, log_level, result_q, geometry_only=False
+):
     setup_logger(cfg["case"], "tree_reconstruction", level=log_level)
     for noisy in ["trimesh", "rasterio", "fiona", "shapely"]:
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    process_chunk(tile_dir, cfg, chunk_size, overwrite, keep_cache, max_trees, result_q)
+    process_chunk(tile_dir, cfg, chunk_size, overwrite, keep_cache, max_trees, result_q, geometry_only)
 
 
 # ---------------------------------------------------------------------
@@ -376,6 +415,7 @@ def _run_tile(
     keep_cache: bool,
     max_trees: int | None,
     log_level: str,
+    geometry_only: bool = False,
 ) -> dict:
     tile = TileLayout(tile_dir)
     tile_id = tile.tile_id
@@ -384,6 +424,14 @@ def _run_tile(
     if tile.cityjson.exists() and not overwrite:
         logging.info(f"[{tile_id}] CityJSON already exists — skipping")
         return {"tile_id": tile_id, "status": "exists", "chunks": 0}
+
+    # Drop the stale CityJSON up front on an overwrite run. The new one is only
+    # written by the final chunk, so on a multi-chunk tile any chunk after the
+    # first (which resumes with overwrite=False) would otherwise still see the
+    # old file and bail via process_chunk's "exists" guard — abandoning the tile
+    # after the first chunk. Removing it here lets all chunks run to completion.
+    if overwrite and tile.cityjson.exists():
+        tile.cityjson.unlink()
 
     ctx = mp.get_context("spawn")
     chunks_run = 0
@@ -408,6 +456,7 @@ def _run_tile(
                 max_trees,
                 log_level,
                 result_q,
+                geometry_only,
             ),
             name=f"recon-{tile_id}-c{chunks_run}",
         )
@@ -516,6 +565,13 @@ def main():
     parser.add_argument("--keep-cache", action="store_true")
     parser.add_argument("--max-trees", type=int, default=None, help="Limit trees per tile (for testing)")
     parser.add_argument(
+        "--geometry-only",
+        action="store_true",
+        help="Generate crown+trunk geometry only, skipping the expensive descriptive "
+        "metrics (r50, porosity). ~5-6x faster reconstruction; the r50/porosity "
+        "attributes are written as null. Geometry is identical to a full run.",
+    )
+    parser.add_argument(
         "--chunk-size",
         type=int,
         default=_DEFAULT_CHUNK_SIZE,
@@ -535,7 +591,10 @@ def main():
     for noisy in ["trimesh", "rasterio", "fiona", "shapely"]:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    logging.info(f"Reconstruction starting: case={case}, n_cores={n_cores}, chunk_size={args.chunk_size}")
+    logging.info(
+        f"Reconstruction starting: case={case}, n_cores={n_cores}, chunk_size={args.chunk_size}"
+        f"{', geometry-only (no r50/porosity)' if args.geometry_only else ''}"
+    )
 
     tiles_root = CaseLayout.from_config(cfg).tiles_dir
     if not tiles_root.exists():
@@ -559,6 +618,7 @@ def main():
                 args.keep_cache,
                 args.max_trees,
                 args.log_level,
+                args.geometry_only,
             ): t
             for t in tile_dirs
         }

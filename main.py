@@ -71,6 +71,11 @@ def main():
     parser.add_argument("--buffer", type=float, default=20.0, help="Buffer distance around AOI (default 20m)")
     parser.add_argument("--max-trees", type=int, default=None, help="Limit number of trees per tile (for testing)")
     parser.add_argument(
+        "--geometry-only",
+        action="store_true",
+        help="Reconstruction: generate geometry only, skip descriptive metrics (r50, porosity). ~5-6x faster.",
+    )
+    parser.add_argument(
         "--ahn-version",
         type=int,
         choices=(4, 5, 6),
@@ -111,6 +116,8 @@ def main():
     cmd_reconstruction = f"python -m scripts.reconstruction {base_cmd}"
     if args.max_trees is not None:
         cmd_reconstruction += f" --max-trees {args.max_trees}"
+    if args.geometry_only:
+        cmd_reconstruction += " --geometry-only"
 
     # -------------------------------
     # Run stages sequentially
