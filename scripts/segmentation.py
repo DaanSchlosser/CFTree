@@ -149,11 +149,9 @@ def main():
         else:
             if missing_forest_tiles and not args.overwrite:
                 missing_list = ", ".join(missing_forest_tiles)
-                logging.info(
-                    f"Forest generalization will run to fill missing forest.laz for tiles: {missing_list}"
-                )
+                logging.info(f"Forest generalization will run to fill missing forest.laz for tiles: {missing_list}")
             logging.info("Starting forest ID generalization...")
-            result_generalize = generalize_forest_ids(case, overwrite=args.overwrite)
+            result_generalize = generalize_forest_ids(case, overwrite=args.overwrite, n_cores=n_cores)
             logging.info(
                 "Forest generalization complete: %s trees → %s / %s",
                 result_generalize.n_trees,

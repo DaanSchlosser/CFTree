@@ -21,6 +21,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import shapely.geometry as sg
 from shapely.geometry.base import BaseGeometry
 
@@ -37,9 +38,36 @@ class TileSource(ABC):
     def laz_url(self, tile_id: str) -> str:
         """Canonical LAZ URL for `tile_id`."""
 
+    @abstractmethod
+    def core_cell(self, tile_id: str) -> BaseGeometry:
+        """Non-overlapping nominal cell this tile exclusively owns (EPSG:28992).
+
+        The core cells of all tiles in a source partition the plane, so a tree is
+        assigned to exactly one tile by testing which core cell its centroid falls
+        in (see `owns_centroids`). This is the single place that knows a version's
+        cell geometry; callers never branch on the AHN version.
+        """
+
     def lax_url(self, tile_id: str) -> str | None:
         """Optional `.LAX` sidecar URL; `None` if this source does not serve one."""
         return None
+
+    def owns_centroids(self, tile_id: str, cx: np.ndarray, cy: np.ndarray) -> np.ndarray:
+        """Boolean mask of which points `(cx[i], cy[i])` lie in this tile's core cell.
+
+        Uses a half-open rule on the cell's bounding box — south/west edges
+        inclusive, north/east exclusive — so a point on a shared cell edge or
+        corner is owned by exactly one tile, making the partition exact and
+        order-independent. `cx`/`cy` are parallel arrays of EPSG:28992
+        coordinates (scalars are accepted and returned as a 0-d array). This is
+        the single definition of the ownership rule; callers never re-implement
+        the bounds test.
+        """
+        minx, miny, maxx, maxy = self.core_cell(tile_id).bounds
+        cx = np.asarray(cx)
+        cy = np.asarray(cy)
+        mask: np.ndarray = (minx <= cx) & (cx < maxx) & (miny <= cy) & (cy < maxy)
+        return mask
 
 
 class GeoTilesSource(TileSource):
@@ -51,16 +79,43 @@ class GeoTilesSource(TileSource):
         self.name = f"AHN{version}"
         self.attribution = f"AHN{version} (c) Rijkswaterstaat / Waterschappen, CC0 1.0"
         self._base_url = f"https://geotiles.citg.tudelft.nl/AHN{version}_T"
+        self._index_gdf: gpd.GeoDataFrame | None = None
+        self._cell_by_id: dict[str, BaseGeometry] | None = None
+
+    def _load_index(self) -> gpd.GeoDataFrame:
+        """Lazily load and cache the GeoTiles sub-tile index (EPSG:28992).
+
+        Cached on the instance because `core_cell` is queried per tile and the
+        index has tens of thousands of rows; re-reading the shapefile per call
+        would dominate runtime.
+        """
+        if self._index_gdf is None:
+            if not self._index_shp.exists():
+                raise FileNotFoundError(
+                    f"AHN sub-tile index not found: {self._index_shp}. "
+                    "Expected the shipped resource at resources/AHN_subunits_GeoTiles/."
+                )
+            self._index_gdf = gpd.read_file(self._index_shp).to_crs("EPSG:28992")
+        return self._index_gdf
 
     def tiles_for_aoi(self, aoi_geom: BaseGeometry) -> list[str]:
-        if not self._index_shp.exists():
-            raise FileNotFoundError(
-                f"AHN sub-tile index not found: {self._index_shp}. "
-                "Expected the shipped resource at resources/AHN_subunits_GeoTiles/."
-            )
-        gdf = gpd.read_file(self._index_shp).to_crs("EPSG:28992")
+        gdf = self._load_index()
         sel = gdf[gdf.intersects(aoi_geom)]
         return [str(tid) for tid in sel["GT_AHNSUB"].tolist()]
+
+    def core_cell(self, tile_id: str) -> BaseGeometry:
+        # Nominal sub-tile polygon from the GeoTiles index. The downloaded LAZ
+        # tiles overlap, but the index subunits partition the plane; ownership
+        # uses the polygon's axis-aligned bounds (see TileSource.owns_centroids).
+        if self._cell_by_id is None:
+            gdf = self._load_index()
+            self._cell_by_id = {
+                str(tid): geom for tid, geom in zip(gdf["GT_AHNSUB"].tolist(), gdf.geometry.tolist(), strict=True)
+            }
+        try:
+            return self._cell_by_id[str(tile_id)]
+        except KeyError as e:
+            raise KeyError(f"Unknown {self.name} sub-tile id: {tile_id}") from e
 
     def laz_url(self, tile_id: str) -> str:
         return f"{self._base_url}/{tile_id}.LAZ"
@@ -98,6 +153,13 @@ class AHN6KMSource(TileSource):
 
     def laz_url(self, tile_id: str) -> str:
         return f"{self._BASE_URL}/AHN6_2025_C_{tile_id}.COPC.LAZ"
+
+    def core_cell(self, tile_id: str) -> BaseGeometry:
+        # tile_id "x_y" is the SW corner of the 1x1 km cell; reuses the same box
+        # math and id format as tiles_for_aoi.
+        x_str, y_str = tile_id.split("_")
+        x, y = int(x_str), int(y_str)
+        return sg.box(x, y, x + self.TILE_SIZE, y + self.TILE_SIZE)
 
     @classmethod
     def _floor_to_grid(cls, value: float, origin: int) -> int:

@@ -70,6 +70,12 @@ class TileLayout:
     def dtm(self) -> Path:
         return self.dir / "clipped_dtm.tif"
 
+    @property
+    def clip_region(self) -> Path:
+        """Polygon this tile's cloud was clipped to: core cell + halo margin,
+        intersected with the buffered AOI. Written by get_data, read by the clip."""
+        return self.dir / "clip_region.geojson"
+
     # --- vegetation + segmentation ---
     @property
     def vegetation_laz(self) -> Path:
@@ -144,6 +150,16 @@ class CaseLayout:
     @property
     def gtid_map(self) -> Path:
         return self.data_dir / "gtid_map.csv"
+
+    @property
+    def tile_source_manifest(self) -> Path:
+        """Records the AHN version/source used for this case (written by get_data).
+
+        Read back by the segmentation stage so it can resolve each tile's core
+        cell without re-passing --ahn-version; the AHN version is otherwise only
+        a CLI flag and is not in the config.
+        """
+        return self.data_dir / "tile_source.json"
 
     # --- traversal ---
     def tile(self, tile_id: str) -> TileLayout:

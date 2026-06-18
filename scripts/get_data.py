@@ -13,11 +13,15 @@ Example:
 """
 
 import argparse
+import json
 import logging
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import geopandas as gpd
+import laspy
+from shapely.geometry import Polygon, box
 
 from src.config import get_config, setup_logger
 from src.get_data.clip_tile import clip_tile
@@ -29,19 +33,19 @@ from src.tile_layout import CaseLayout
 
 
 # ---------------------------------------------------------------------
-# Tile worker (must be top-level for multiprocessing)
+# Tile workers (must be top-level for multiprocessing)
 # ---------------------------------------------------------------------
-def process_tile(
+def download_one(
     tile_id: str,
     output_dir: Path,
     source: TileSource,
     overwrite: bool,
-    aoi_path: Path,
 ) -> TileOutcome:
-    """Download, clip, and compute DTM for one tile.
+    """Sweep 1: download one tile's raw point cloud.
 
-    Catches `StageError` subclasses to map them to a single `TileOutcome` row
-    for the summary log; never re-raises (keeps the pool moving).
+    A separate sweep from clipping because a tile's clip now reads its
+    neighbours' raw clouds (the halo); all downloads must finish before any clip
+    starts, or which border points a clip sees would depend on download order.
     """
     try:
         dl = download_tile(tile_id, output_dir, source, overwrite=overwrite)
@@ -51,9 +55,24 @@ def process_tile(
     except StageError as e:
         logging.warning(f"[{tile_id}] Download failed: {e}")
         return TileOutcome(tile_id=tile_id, status="download_failed", detail=str(e))
+    return TileOutcome(tile_id=tile_id, status="downloaded", paths={"raw": dl.laz})
 
+
+def clip_and_dtm(
+    tile_id: str,
+    output_dir: Path,
+    inputs: list[Path],
+    overwrite: bool,
+) -> TileOutcome:
+    """Sweep 2: clip the tile's own + neighbour clouds to its halo region, then DTM.
+
+    `inputs` is the owning tile's `raw.laz` plus neighbour `raw.laz` overlapping
+    the tile's halo region (built in the parent); the clip region is written to
+    `tile.clip_region` there.
+    """
+    tile = CaseLayout(data_dir=output_dir).tile(tile_id)
     try:
-        clip = clip_tile(dl.laz, aoi_path, overwrite=overwrite)
+        clip = clip_tile(inputs, tile.clip_region, tile.clipped_laz, overwrite=overwrite)
     except MissingPrerequisiteError as e:
         logging.error(f"[{tile_id}] Clip prerequisite missing: {e}")
         return TileOutcome(tile_id=tile_id, status="clip_prereq_missing", detail=str(e))
@@ -61,24 +80,45 @@ def process_tile(
         logging.warning(f"[{tile_id}] Clip failed: {e}")
         return TileOutcome(tile_id=tile_id, status="clip_failed", detail=str(e))
 
-    dtm_out = clip.clipped.parent / "clipped_dtm.tif"
     try:
         logging.info(f"[{tile_id}] Computing DTM from clipped tile...")
-        dtm = compute_tile_dtm(clip.clipped, dtm_out, ground_only=True, overwrite=overwrite)
+        dtm = compute_tile_dtm(clip.clipped, tile.dtm, ground_only=True, overwrite=overwrite)
     except StageError as e:
         logging.warning(f"[{tile_id}] DTM generation failed: {e}")
-        return TileOutcome(
-            tile_id=tile_id,
-            status="dtm_failed",
-            paths={"raw": dl.laz, "clipped": clip.clipped},
-            detail=str(e),
-        )
+        return TileOutcome(tile_id=tile_id, status="dtm_failed", paths={"clipped": clip.clipped}, detail=str(e))
 
-    return TileOutcome(
-        tile_id=tile_id,
-        status="ok",
-        paths={"raw": dl.laz, "clipped": clip.clipped, "dtm": dtm.dtm},
-    )
+    return TileOutcome(tile_id=tile_id, status="ok", paths={"clipped": clip.clipped, "dtm": dtm.dtm})
+
+
+def run_sweep(
+    worker: Callable[..., TileOutcome],
+    tasks: list[tuple],
+    n_cores: int,
+) -> list[TileOutcome]:
+    """Run `worker(*task)` over `tasks`, in parallel when n_cores > 1.
+
+    `task[0]` must be the tile id (used for the per-tile log line). A worker that
+    raises is recorded as an `exception` outcome rather than aborting the sweep.
+    """
+    outcomes: list[TileOutcome] = []
+    if n_cores > 1 and len(tasks) > 1:
+        with ProcessPoolExecutor(max_workers=n_cores) as pool:
+            futures = {pool.submit(worker, *t): t[0] for t in tasks}
+            for f in as_completed(futures):
+                tid = futures[f]
+                try:
+                    res = f.result()
+                    outcomes.append(res)
+                    logging.info(f"[{tid}] {res.status.upper()}")
+                except Exception as e:
+                    logging.warning(f"[{tid}] Exception: {e}")
+                    outcomes.append(TileOutcome(tile_id=str(tid), status="exception", detail=str(e)))
+    else:
+        for t in tasks:
+            res = worker(*t)
+            outcomes.append(res)
+            logging.info(f"[{res.tile_id}] {res.status.upper()}")
+    return outcomes
 
 
 # ---------------------------------------------------------------------
@@ -92,6 +132,14 @@ def main():
     parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG, INFO, WARNING)")
     parser.add_argument("--dry-run", action="store_true", help="Only list tiles to be processed")
     parser.add_argument("--buffer", type=float, default=20.0, help="Buffer in meters around AOI")
+    parser.add_argument(
+        "--halo-margin",
+        type=float,
+        default=12.0,
+        help="Per-tile overlap (m) into neighbouring tiles so a border tree is reconstructed "
+        "whole in its owning tile (default: 12). Should exceed the largest crown radius and be "
+        "<= --buffer.",
+    )
     parser.add_argument(
         "--ahn-version",
         type=int,
@@ -135,6 +183,12 @@ def main():
     source = from_version(args.ahn_version, resources_dir)
     logging.info(f"Tile source: {source.name}, {source.attribution}")
 
+    # Persist the AHN version/source so the segmentation stage can resolve each
+    # tile's core cell for ownership-based dedup (the version is only a CLI flag,
+    # not part of the config that downstream stages load).
+    layout.data_dir.mkdir(parents=True, exist_ok=True)
+    layout.tile_source_manifest.write_text(json.dumps({"ahn_version": args.ahn_version, "source": source.name}))
+
     tile_ids = source.tiles_for_aoi(aoi.union_all())
 
     if not tile_ids:
@@ -150,29 +204,68 @@ def main():
         return
 
     # ------------------------------------------------------------------
-    # Step 3: Per-tile pipeline (download → clip → DTM)
+    # Step 3: download all tiles (barrier), then clip + DTM with a halo
     # ------------------------------------------------------------------
-    if n_cores > 1:
-        logging.info(f"Running {len(tile_ids)} tiles in parallel using {n_cores} cores.")
-        with ProcessPoolExecutor(max_workers=n_cores) as pool:
-            futures = {
-                pool.submit(process_tile, tid, output_dir, source, args.overwrite, buffered_aoi_path): tid
-                for tid in tile_ids
-            }
-            for f in as_completed(futures):
-                tid = futures[f]
-                try:
-                    result = f.result()
-                    logging.info(f"[{tid}] {result.status.upper()}")
-                except Exception as e:
-                    logging.warning(f"[{tid}] Exception: {e}")
-    else:
-        logging.info("Running serial mode.")
-        for tid in tile_ids:
-            result = process_tile(tid, output_dir, source, args.overwrite, buffered_aoi_path)
-            logging.info(f"[{tid}] {result.status.upper()}")
+    margin = args.halo_margin
+    if args.buffer < margin:
+        logging.warning(
+            f"--buffer ({args.buffer} m) < --halo-margin ({margin} m): AOI-perimeter neighbour "
+            "clouds may not be downloaded, leaving border crowns incomplete there. "
+            "Increase --buffer to at least the halo margin."
+        )
 
-    logging.info(f"Completed get_data for case: {case}")
+    # Sweep 1: download every tile. Must finish before any clip starts, because a
+    # tile's clip now reads its neighbours' raw clouds (the halo) — otherwise which
+    # border points a clip sees would depend on download order (non-deterministic).
+    logging.info(f"Downloading {len(tile_ids)} tiles ({n_cores} workers)...")
+    run_sweep(download_one, [(tid, output_dir, source, args.overwrite) for tid in tile_ids], n_cores)
+
+    present = [tid for tid in tile_ids if layout.tile(tid).raw_laz.exists()]
+    if not present:
+        logging.error("No tiles downloaded successfully; nothing to clip.")
+        return
+    logging.info(f"{len(present)}/{len(tile_ids)} tiles downloaded; building halo clip regions.")
+
+    # Build each tile's clip region (its core cell + halo margin, intersected with
+    # the buffered AOI) and the neighbour raw clouds needed to fill it.
+    buffered_geom = aoi.union_all()
+    cells = {tid: source.core_cell(tid) for tid in present}
+    # Actual extent of each tile's own raw cloud (from the LAZ header). This is what
+    # makes the halo gather uniform across AHN versions WITHOUT a per-version branch
+    # and without duplicating points: we only pull a neighbour for the part of the
+    # region the tile's OWN raw does not already cover. Hard-partitioned AHN6 raws
+    # stop at the cell edge, so the margin band is "missing" and the (disjoint)
+    # neighbour cells are pulled to fill it; already-overlapping AHN4/5 raws cover
+    # the whole region, so nothing is missing and the clip degenerates to a single
+    # input. (This stays duplicate-point-free as long as the halo margin does not
+    # exceed an overlapping source's inter-tile overlap — true for AHN4/5's ~20 m
+    # vs the 12 m default; AHN6 has zero overlap so any margin is safe.)
+    raw_bbox: dict[str, Polygon] = {}
+    for tid in present:
+        with laspy.open(layout.tile(tid).raw_laz) as f:
+            h = f.header
+            raw_bbox[tid] = box(h.x_min, h.y_min, h.x_max, h.y_max)
+
+    clip_tasks: list[tuple] = []
+    for tid in present:
+        minx, miny, maxx, maxy = cells[tid].bounds
+        region = box(minx - margin, miny - margin, maxx + margin, maxy + margin).intersection(buffered_geom)
+        if region.is_empty:
+            region = box(minx - margin, miny - margin, maxx + margin, maxy + margin)
+        tile = layout.tile(tid)
+        gpd.GeoDataFrame(geometry=[region], crs=cfg["crs"]).to_file(tile.clip_region, driver="GeoJSON")
+        inputs = [tile.raw_laz]
+        missing = region.difference(raw_bbox[tid])
+        if missing.area > 1e-6:  # the tile's own raw does not cover the whole region
+            inputs += [layout.tile(nbr).raw_laz for nbr in present if nbr != tid and raw_bbox[nbr].intersects(missing)]
+        clip_tasks.append((tid, output_dir, inputs, args.overwrite))
+
+    # Sweep 2: clip (with halo) + DTM, per tile.
+    logging.info(f"Clipping + DTM for {len(clip_tasks)} tiles ({n_cores} workers)...")
+    outcomes = run_sweep(clip_and_dtm, clip_tasks, n_cores)
+
+    n_ok = sum(1 for o in outcomes if o.status == "ok")
+    logging.info(f"Completed get_data for case: {case} — {n_ok}/{len(clip_tasks)} tiles clipped + DTM ok")
 
 
 # ---------------------------------------------------------------------

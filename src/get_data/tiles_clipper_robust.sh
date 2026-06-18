@@ -6,86 +6,85 @@
 
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# Clip a single LAZ file using PDAL crop filter.
+# Clip one or more LAZ files to a region polygon using PDAL, writing one LAZ.
 #
 # Usage:
-#   bash src/get_data/tiles_clipper_robust.sh <input_laz> <aoi_geojson> <output_laz>
+#   bash src/get_data/tiles_clipper_robust.sh <region_geojson> <output_laz> <input_laz> [<input_laz> ...]
 #
-# Example:
-#   bash src/get_data/tiles_clipper_robust.sh \
-#       data/wippolder/tiles/37EN2_11/raw.laz \
-#       cases/wippolder/city_bbox_buffered.geojson \
-#       data/wippolder/tiles/37EN2_11/clipped.laz
-#
-# The AOI is automatically converted to WKT.
-# Output is written to the specified clipped LAZ path.
+# Multiple inputs (a tile plus its neighbours' overlap) are merged before the
+# crop so a tree straddling a tile boundary is clipped from the combined cloud
+# (the "halo"). With a single input this is the plain per-tile clip. The region
+# is the owning tile's core cell expanded by the halo margin, intersected with
+# the buffered AOI; it is converted to WKT automatically.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
 
-INPUT_LAZ="${1:-}"
-AOI_GEOJSON="${2:-}"
-OUTPUT_LAZ="${3:-}"
+REGION_GEOJSON="${1:-}"
+OUTPUT_LAZ="${2:-}"
+shift 2 2>/dev/null || true
+INPUTS=("$@")
 
-if [[ -z "$INPUT_LAZ" || -z "$AOI_GEOJSON" || -z "$OUTPUT_LAZ" ]]; then
-    echo "Usage: $0 <input_laz> <aoi_geojson> <output_laz>"
+if [[ -z "$REGION_GEOJSON" || -z "$OUTPUT_LAZ" || ${#INPUTS[@]} -eq 0 ]]; then
+    echo "Usage: $0 <region_geojson> <output_laz> <input_laz> [<input_laz> ...]"
     exit 1
 fi
 
-if [[ ! -f "$INPUT_LAZ" ]]; then
-    echo "ERROR: Input LAZ file not found: $INPUT_LAZ"
-    exit 2
-fi
-
-if [[ ! -f "$AOI_GEOJSON" ]]; then
-    echo "ERROR: AOI GeoJSON not found: $AOI_GEOJSON"
+if [[ ! -f "$REGION_GEOJSON" ]]; then
+    echo "ERROR: region GeoJSON not found: $REGION_GEOJSON"
     exit 3
 fi
 
-TILE_ID="$(basename "$(dirname "$INPUT_LAZ")")"
-TMP_DIR="/tmp/tmp_pdal_${TILE_ID}_$$"
-mkdir -p "$TMP_DIR"
+for f in "${INPUTS[@]}"; do
+    if [[ ! -f "$f" ]]; then
+        echo "ERROR: input LAZ not found: $f"
+        exit 2
+    fi
+done
 
-# Convert polygon to WKT
-WKT_FILE="$TMP_DIR/aoi.wkt"
-ogrinfo -geom=YES -al "$AOI_GEOJSON" | grep POLYGON | head -n 1 | sed 's/^[ \t]*//' > "$WKT_FILE"
+TILE_ID="$(basename "$(dirname "$OUTPUT_LAZ")")"
+TMP_DIR="$(mktemp -d "/tmp/tmp_pdal_${TILE_ID}_XXXXXX")"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+# Convert region polygon to WKT
+WKT_FILE="$TMP_DIR/region.wkt"
+ogrinfo -geom=YES -al "$REGION_GEOJSON" | grep POLYGON | head -n 1 | sed 's/^[ \t]*//' > "$WKT_FILE"
 
 if [[ ! -s "$WKT_FILE" ]]; then
-    echo "ERROR: Failed to extract WKT from $AOI_GEOJSON"
-    rm -rf "$TMP_DIR"
+    echo "ERROR: Failed to extract WKT from $REGION_GEOJSON"
     exit 4
 fi
 
-# Build PDAL pipeline
+# Build the PDAL pipeline: N readers -> merge -> crop -> writer.
 PIPELINE_FILE="$TMP_DIR/${TILE_ID}_clip.json"
-
-cat > "$PIPELINE_FILE" <<EOF
 {
-  "pipeline": [
-    "$INPUT_LAZ",
-    {
-      "type": "filters.crop",
-      "polygon": "$(cat "$WKT_FILE")"
-    },
-    {
-      "type": "writers.las",
-      "filename": "$OUTPUT_LAZ",
-      "compression": true,
-      "minor_version": 4,
-      "dataformat_id": 8
-    }
-  ]
-}
-EOF
+    echo '{'
+    echo '  "pipeline": ['
+    for f in "${INPUTS[@]}"; do
+        echo "    \"$f\","
+    done
+    echo '    {"type": "filters.merge"},'
+    echo '    {'
+    echo '      "type": "filters.crop",'
+    echo "      \"polygon\": \"$(cat "$WKT_FILE")\""
+    echo '    },'
+    echo '    {'
+    echo '      "type": "writers.las",'
+    echo "      \"filename\": \"$OUTPUT_LAZ\","
+    echo '      "compression": true,'
+    echo '      "minor_version": 4,'
+    echo '      "dataformat_id": 8'
+    echo '    }'
+    echo '  ]'
+    echo '}'
+} > "$PIPELINE_FILE"
 
 # Run PDAL clipping
-echo "[$TILE_ID] Clipping..."
-pdal pipeline "$PIPELINE_FILE" > "$TMP_DIR/pdal.log" 2>&1 || {
-    echo "[$TILE_ID] ERROR: PDAL clipping failed — see $TMP_DIR/pdal.log"
-    rm -rf "$TMP_DIR"
+echo "[$TILE_ID] Clipping ${#INPUTS[@]} input(s)..."
+if ! pdal pipeline "$PIPELINE_FILE" > "$TMP_DIR/pdal.log" 2>&1; then
+    echo "[$TILE_ID] ERROR: PDAL clipping failed:"
+    cat "$TMP_DIR/pdal.log"
     exit 5
-}
+fi
 
-# Cleanup
-rm -rf "$TMP_DIR"
 echo "[$TILE_ID] Done: clipped to $OUTPUT_LAZ"

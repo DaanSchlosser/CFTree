@@ -9,39 +9,52 @@ import subprocess
 from pathlib import Path
 
 from src.stages import ClipResult, MissingPrerequisiteError, StageFailureError
-from src.tile_layout import TileLayout
 
 
-def clip_tile(laz_path: Path, aoi_path: Path, output_dir: Path | None = None, overwrite: bool = False) -> ClipResult:
-    """Clip a single LAZ file using PDAL through the robust bash script.
+def clip_tile(
+    inputs: list[Path],
+    region_path: Path,
+    output_path: Path,
+    overwrite: bool = False,
+) -> ClipResult:
+    """Clip one or more LAZ files to `region_path`, writing one `output_path`.
+
+    `inputs` is the owning tile's `raw.laz` plus any neighbour `raw.laz` that
+    overlap the tile's halo region; they are merged before the crop so a tree
+    straddling a tile boundary is reconstructed from the combined cloud. With a
+    single input this is the plain per-tile clip.
+
+    The owning tile id is taken from `output_path`'s parent directory (the tile
+    that owns the clipped result), not from any input path.
 
     Raises
     ------
     MissingPrerequisiteError
-        Input LAZ, AOI file, or the bash script is not on disk.
+        An input LAZ, the region file, or the bash script is not on disk.
     StageFailureError
         PDAL ran but did not produce the expected output.
     """
     script_path = Path(__file__).parent / "tiles_clipper_robust.sh"
-    tile_id = laz_path.parent.name
-    output_dir = output_dir or laz_path.parent
-    clipped_path = TileLayout(output_dir).clipped_laz
+    tile_id = output_path.parent.name
 
     if not script_path.exists():
         raise MissingPrerequisiteError(f"[{tile_id}] Clipping script not found: {script_path}")
-    if not laz_path.exists():
-        raise MissingPrerequisiteError(f"[{tile_id}] Input LAZ not found: {laz_path}")
-    if not aoi_path.exists():
-        raise MissingPrerequisiteError(f"[{tile_id}] AOI file not found: {aoi_path}")
+    if not inputs:
+        raise MissingPrerequisiteError(f"[{tile_id}] No input LAZ files given to clip")
+    for laz in inputs:
+        if not laz.exists():
+            raise MissingPrerequisiteError(f"[{tile_id}] Input LAZ not found: {laz}")
+    if not region_path.exists():
+        raise MissingPrerequisiteError(f"[{tile_id}] Clip region not found: {region_path}")
 
-    if clipped_path.exists() and not overwrite:
+    if output_path.exists() and not overwrite:
         logging.info(f"[{tile_id}] Skipping existing clipped tile")
-        return ClipResult(clipped=clipped_path, did_work=False)
+        return ClipResult(clipped=output_path, did_work=False)
 
-    logging.info(f"[{tile_id}] Clipping raw tile → {clipped_path.name}")
+    logging.info(f"[{tile_id}] Clipping {len(inputs)} input(s) → {output_path.name}")
     try:
         subprocess.run(
-            ["bash", str(script_path), str(laz_path), str(aoi_path), str(clipped_path)],
+            ["bash", str(script_path), str(region_path), str(output_path), *[str(p) for p in inputs]],
             check=True,
             capture_output=True,
         )
@@ -49,8 +62,8 @@ def clip_tile(laz_path: Path, aoi_path: Path, output_dir: Path | None = None, ov
         stderr = e.stderr.decode(errors="ignore").strip()
         raise StageFailureError(f"[{tile_id}] Clipping failed: {stderr}") from e
 
-    if not clipped_path.exists():
-        raise StageFailureError(f"[{tile_id}] Clipping completed but file missing: {clipped_path}")
+    if not output_path.exists():
+        raise StageFailureError(f"[{tile_id}] Clipping completed but file missing: {output_path}")
 
-    logging.info(f"[{tile_id}] Clipped successfully → {clipped_path}")
-    return ClipResult(clipped=clipped_path, did_work=True)
+    logging.info(f"[{tile_id}] Clipped successfully → {output_path}")
+    return ClipResult(clipped=output_path, did_work=True)
