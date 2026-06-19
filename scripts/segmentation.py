@@ -21,7 +21,13 @@ from pathlib import Path
 from src.config import get_config, setup_logger
 from src.segmentation.generalize_forest_ids import generalize_forest_ids
 from src.segmentation.segment_tile import segment_tile
-from src.stages import MissingPrerequisiteError, StageError, TileOutcome, failed_statuses
+from src.stages import (
+    MissingPrerequisiteError,
+    StageError,
+    TileOutcome,
+    failed_statuses,
+    missing_tiles_exit_code,
+)
 from src.tile_layout import CaseLayout, TileLayout
 from src.vegetation_filter.HOMED_vegetation_filter import filter_tile
 
@@ -89,8 +95,15 @@ def main() -> int:
     layout = CaseLayout.from_config(cfg)
     tiles_root = layout.tiles_dir
     if not tiles_root.exists():
-        logging.error(f"Tiles directory not found: {tiles_root}")
-        return 1
+        # A real run needs tiles to process (a failure); a --dry-run only lists
+        # what would be processed, so an absent directory is simply nothing to
+        # list, not an error. This keeps `main.py --dry-run` (whose get_data
+        # exits before creating tiles) from aborting the whole preflight.
+        if args.dry_run:
+            logging.info(f"No tiles directory yet at {tiles_root} — nothing to list.")
+        else:
+            logging.error(f"Tiles directory not found: {tiles_root}")
+        return missing_tiles_exit_code(dry_run=args.dry_run)
 
     tile_dirs = sorted([p for p in tiles_root.iterdir() if TileLayout(p).clipped_laz.exists()])
     if not tile_dirs:
@@ -157,7 +170,7 @@ def main() -> int:
                 missing_list = ", ".join(missing_forest_tiles)
                 logging.info(f"Forest generalization will run to fill missing forest.laz for tiles: {missing_list}")
             logging.info("Starting forest ID generalization...")
-            result_generalize = generalize_forest_ids(case, overwrite=args.overwrite, n_cores=n_cores)
+            result_generalize = generalize_forest_ids(case, n_cores=n_cores)
             logging.info(
                 "Forest generalization complete: %s trees → %s / %s",
                 result_generalize.n_trees,

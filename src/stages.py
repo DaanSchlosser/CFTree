@@ -181,3 +181,62 @@ def failed_statuses(statuses: Iterable[str]) -> list[str]:
     out-of-coverage tiles still exits 0. See :data:`FAILURE_STATUSES`.
     """
     return [s for s in statuses if s in FAILURE_STATUSES]
+
+
+# ---------------------------------------------------------------------
+# forest.laz enrichment outcomes (generalize_forest_ids)
+# ---------------------------------------------------------------------
+# A tile's forest.laz enrichment either WROTE its points, was legitimately
+# SKIPPED (optional inputs absent, no GTID matches, nothing to do), or
+# genuinely FAILED (an I/O error reading segmentation.xyz / vegetation.laz or
+# writing forest.laz). The distinction is the point: a SKIP is a valid empty
+# result, but a FAILURE means a tile that should have produced trees did not,
+# so segmentation must abort rather than let reconstruction proceed on the gap
+# and a partial run be cached as complete. Kept here, beside FAILURE_STATUSES,
+# so the one-tile-one-status convention has a single home.
+FOREST_ENRICH_WRITTEN = "written"
+FOREST_ENRICH_SKIPPED = "skipped"
+FOREST_ENRICH_FAILED = "failed"
+
+
+def forest_enrichment_failures(outcomes: Iterable[tuple[str, str]]) -> list[str]:
+    """Return tile ids whose forest.laz enrichment genuinely failed.
+
+    *outcomes* is an iterable of ``(tile_id, status)`` pairs. Only
+    :data:`FOREST_ENRICH_FAILED` counts; a written tile or a legitimate skip
+    does not. An empty result means segmentation may exit 0.
+    """
+    return [tile_id for tile_id, status in outcomes if status == FOREST_ENRICH_FAILED]
+
+
+def missing_tiles_exit_code(*, dry_run: bool) -> int:
+    """Exit code for a stage whose tiles directory is absent.
+
+    A real run needs tiles to process, so a missing directory is a failure
+    (exit 1). A ``--dry-run`` only lists what *would* be processed; with no
+    tiles there is simply nothing to list, which is not an error (exit 0). The
+    full-pipeline dry-run relies on this: ``get_data --dry-run`` exits before
+    downloading and never creates the tiles directory, so the following
+    segmentation/reconstruction dry-runs must not abort on its absence.
+    """
+    return 0 if dry_run else 1
+
+
+def should_reconstruct(
+    *,
+    output_exists: bool,
+    overwrite: bool,
+    existing_is_geometry_only: bool,
+    requested_geometry_only: bool,
+) -> bool:
+    """Whether a tile's reconstruction must (re)run rather than reuse its output.
+
+    Re-run when there is no output, on an explicit overwrite, or when the
+    existing output was produced ``--geometry-only`` (its r50/porosity are
+    null) but full descriptive metrics are now requested. Reuse otherwise:
+    a full output satisfies any request, and a geometry-only output satisfies
+    a geometry-only request (the geometry is identical to a full run).
+    """
+    if not output_exists or overwrite:
+        return True
+    return existing_is_geometry_only and not requested_geometry_only

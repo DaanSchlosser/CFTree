@@ -24,7 +24,17 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import main as cftree_main  # noqa: E402
-from src.stages import FAILURE_STATUSES, StageError, failed_statuses  # noqa: E402
+from src.stages import (  # noqa: E402
+    FAILURE_STATUSES,
+    FOREST_ENRICH_FAILED,
+    FOREST_ENRICH_SKIPPED,
+    FOREST_ENRICH_WRITTEN,
+    StageError,
+    failed_statuses,
+    forest_enrichment_failures,
+    missing_tiles_exit_code,
+    should_reconstruct,
+)
 
 
 def test_failed_statuses_empty_for_success_and_graceful_skips() -> None:
@@ -55,3 +65,68 @@ def test_run_stage_raises_on_nonzero_exit() -> None:
 def test_run_stage_returns_on_clean_exit() -> None:
     # A clean stage must not raise.
     assert cftree_main.run_stage("diagstage", "exit 0") is None
+
+
+# ---------------------------------------------------------------------
+# forest.laz enrichment: a genuine failure must not look like a skip
+# ---------------------------------------------------------------------
+def test_forest_enrichment_failures_flags_only_genuine_failures() -> None:
+    # A written tile and a legitimate skip are not failures; an I/O failure is.
+    # This is the seam the bug crossed: a swallowed write error used to be
+    # indistinguishable from "nothing to write" (both returned 0 points).
+    outcomes = [
+        ("t1", FOREST_ENRICH_WRITTEN),
+        ("t2", FOREST_ENRICH_SKIPPED),
+        ("t3", FOREST_ENRICH_FAILED),
+    ]
+    assert forest_enrichment_failures(outcomes) == ["t3"]
+
+
+def test_forest_enrichment_failures_empty_for_writes_and_skips() -> None:
+    outcomes = [("t1", FOREST_ENRICH_WRITTEN), ("t2", FOREST_ENRICH_SKIPPED)]
+    assert forest_enrichment_failures(outcomes) == []
+    assert forest_enrichment_failures([]) == []
+
+
+# ---------------------------------------------------------------------
+# --dry-run must not be aborted by an absent tiles directory
+# ---------------------------------------------------------------------
+def test_missing_tiles_is_fatal_only_for_a_real_run() -> None:
+    # A real run needs tiles (exit 1); a dry-run has nothing to list (exit 0),
+    # so `main.py --dry-run` on a not-yet-downloaded case does not abort.
+    assert missing_tiles_exit_code(dry_run=False) == 1
+    assert missing_tiles_exit_code(dry_run=True) == 0
+
+
+# ---------------------------------------------------------------------
+# geometry-only output must not be reused when full metrics are requested
+# ---------------------------------------------------------------------
+def test_should_reconstruct_rebuilds_geometry_only_for_full_metrics() -> None:
+    # The bug: a geometry-only CityJSON (r50/porosity null) was reused as if
+    # complete on a later full run. Only this combination must force a rebuild.
+    assert should_reconstruct(
+        output_exists=True, overwrite=False, existing_is_geometry_only=True, requested_geometry_only=False
+    )
+
+
+def test_should_reconstruct_reuses_when_safe() -> None:
+    # A full output satisfies any request; a geometry-only output satisfies a
+    # geometry-only request (identical geometry).
+    assert not should_reconstruct(
+        output_exists=True, overwrite=False, existing_is_geometry_only=False, requested_geometry_only=False
+    )
+    assert not should_reconstruct(
+        output_exists=True, overwrite=False, existing_is_geometry_only=False, requested_geometry_only=True
+    )
+    assert not should_reconstruct(
+        output_exists=True, overwrite=False, existing_is_geometry_only=True, requested_geometry_only=True
+    )
+
+
+def test_should_reconstruct_runs_when_absent_or_overwrite() -> None:
+    assert should_reconstruct(
+        output_exists=False, overwrite=False, existing_is_geometry_only=False, requested_geometry_only=False
+    )
+    assert should_reconstruct(
+        output_exists=True, overwrite=True, existing_is_geometry_only=False, requested_geometry_only=False
+    )

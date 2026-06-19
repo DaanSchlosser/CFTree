@@ -103,6 +103,15 @@ class TileLayout:
         return self.dir / "trees_lod3.city.json"
 
     @property
+    def geometry_only_marker(self) -> Path:
+        """Present iff ``cityjson`` was written in ``--geometry-only`` mode.
+
+        Lets a later full run tell a geometry-only output (r50/porosity null)
+        from a complete one and rebuild it, instead of reusing the nulls as if
+        finished. Absent means a full run (or a legacy pre-marker output)."""
+        return self.dir / "trees_lod3.geometry_only"
+
+    @property
     def cache(self) -> TileCacheLayout:
         return TileCacheLayout(self.dir / "_cache")
 

@@ -89,7 +89,10 @@ def clip_and_dtm(
 
     try:
         logging.info(f"[{tile_id}] Computing DTM from clipped tile...")
-        dtm = compute_tile_dtm(clip.clipped, tile.dtm, ground_only=True, overwrite=overwrite)
+        # Recompute the DTM whenever the clip actually (re)ran: a clip
+        # invalidated by a changed region/inputs would otherwise leave a stale
+        # DTM derived from the old point support.
+        dtm = compute_tile_dtm(clip.clipped, tile.dtm, ground_only=True, overwrite=overwrite or clip.did_work)
     except StageError as e:
         logging.warning(f"[{tile_id}] DTM generation failed: {e}")
         return TileOutcome(tile_id=tile_id, status="dtm_failed", paths={"clipped": clip.clipped}, detail=str(e))

@@ -57,11 +57,11 @@ from scipy.spatial import cKDTree
 from trimesh import load as load_mesh
 
 from src.config import ResolvedConfig, get_config, setup_logger
-from src.reconstruction.alpha_wrap_tree import AlphaWrapServer
+from src.reconstruction.alpha_wrap_tree import AlphaWrapServer, AlphaWrapTimeoutError
 from src.reconstruction.construct_geometry import construct_lod3
 from src.reconstruction.extract_tree_metrics import compute_tree_metrics
 from src.reconstruction.write_cityjson import add_tree, finalize_cityjson, init_cityjson
-from src.stages import StageError
+from src.stages import StageError, missing_tiles_exit_code, should_reconstruct
 from src.tile_layout import CaseLayout, TileCacheLayout, TileLayout
 
 # ---------------------------------------------------------------------
@@ -305,6 +305,17 @@ def process_chunk(
 
             try:
                 res_alpha = awrap.wrap(xyz_path, cache.tree_ply(gid))
+            except AlphaWrapTimeoutError as e:
+                # A genuine CGAL hang: deterministic and expensive (it re-stalls
+                # the full per-tree timeout on every resume). Retire the gtid
+                # durably so a rerun skips it, rather than paying the timeout
+                # again. The persistent coprocess died with the wrap, so it
+                # respawns on the next tree.
+                logging.warning(f"[{tile_id}] GTID {gid}: alpha wrap timed out — retiring permanently ({e})")
+                _append_durable(cache.skipped, str(gid))
+                skipped.add(gid)
+                cache.in_flight.unlink(missing_ok=True)
+                continue
             except StageError as e:
                 logging.warning(f"[{tile_id}] GTID {gid}: alpha wrap failed ({e})")
                 cache.in_flight.unlink(missing_ok=True)
@@ -377,6 +388,14 @@ def process_chunk(
             json.dump(city_final, f, separators=(",", ":"))
         logging.info(f"[{tile_id}] CityJSON written: {tile.cityjson.name} ({n_objects} trees, {len(skipped)} skipped)")
 
+        # Record which mode produced this CityJSON. A geometry-only output has
+        # null r50/porosity; the marker lets a later full run tell it from a
+        # complete one and rebuild rather than reuse the nulls (see _run_tile).
+        if geometry_only:
+            _write_atomic(tile.geometry_only_marker, "1")
+        else:
+            tile.geometry_only_marker.unlink(missing_ok=True)
+
         if not keep_cache:
             shutil.rmtree(cache.root, ignore_errors=True)
 
@@ -422,9 +441,23 @@ def _run_tile(
     tile_id = tile.tile_id
     cache = tile.cache
 
-    if tile.cityjson.exists() and not overwrite:
+    existing_geometry_only = tile.geometry_only_marker.exists()
+    if not should_reconstruct(
+        output_exists=tile.cityjson.exists(),
+        overwrite=overwrite,
+        existing_is_geometry_only=existing_geometry_only,
+        requested_geometry_only=geometry_only,
+    ):
         logging.info(f"[{tile_id}] CityJSON already exists — skipping")
         return {"tile_id": tile_id, "status": "exists", "chunks": 0}
+
+    # Reaching here with an existing CityJSON and no explicit --overwrite means a
+    # geometry-only output is being upgraded to full metrics. Force a rebuild so
+    # the cached null-metric trees (_cache/*.pkl) are recomputed rather than
+    # reused, not just the CityJSON re-emitted.
+    if tile.cityjson.exists() and not overwrite:
+        logging.info(f"[{tile_id}] Existing CityJSON is geometry-only — rebuilding for full metrics")
+        overwrite = True
 
     # Drop the stale CityJSON up front on an overwrite run. The new one is only
     # written by the final chunk, so on a multi-chunk tile any chunk after the
@@ -599,8 +632,14 @@ def main() -> int:
 
     tiles_root = CaseLayout.from_config(cfg).tiles_dir
     if not tiles_root.exists():
-        logging.error(f"No tiles found at {tiles_root}")
-        return 1
+        # Missing tiles abort a real run, but a --dry-run has nothing to list
+        # (its predecessors may not have produced tiles yet). See
+        # missing_tiles_exit_code.
+        if args.dry_run:
+            logging.info(f"No tiles directory yet at {tiles_root} — nothing to list.")
+        else:
+            logging.error(f"No tiles found at {tiles_root}")
+        return missing_tiles_exit_code(dry_run=args.dry_run)
 
     tile_dirs = [p for p in tiles_root.iterdir() if p.is_dir()]
     if args.dry_run:

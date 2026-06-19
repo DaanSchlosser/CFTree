@@ -36,19 +36,37 @@ import pandas as pd
 
 from src.config import get_config
 from src.get_data.tile_sources import from_version
-from src.stages import GeneralizeForestIdsResult, MissingPrerequisiteError, StageFailureError
+from src.stages import (
+    FOREST_ENRICH_FAILED,
+    FOREST_ENRICH_SKIPPED,
+    FOREST_ENRICH_WRITTEN,
+    GeneralizeForestIdsResult,
+    MissingPrerequisiteError,
+    StageFailureError,
+    forest_enrichment_failures,
+)
 from src.tile_layout import CaseLayout, TileLayout
 
 
-def _write_forest_laz(tile_dir: Path, tile_map: pd.DataFrame, overwrite: bool) -> tuple[str, int]:
+def _write_forest_laz(tile_dir: Path, tile_map: pd.DataFrame) -> tuple[str, int, str]:
     """Attach GTIDs to one tile's vegetation points and write `forest.laz`.
 
     Pure per-tile work (reads its own ``segmentation.xyz`` + ``vegetation.laz``,
     writes its own ``forest.laz``) with no shared mutable state, so tiles can run
     concurrently. `tile_map` is the slice of the global GTID map for this tile.
 
-    Returns ``(tile_name, n_points_written)``; ``n_points_written == 0`` means the
-    tile was skipped (missing inputs, already present, or no GTID matches).
+    Returns ``(tile_name, n_points_written, status)`` where status is one of
+    :data:`FOREST_ENRICH_WRITTEN`, :data:`FOREST_ENRICH_SKIPPED` (a valid empty
+    result: optional inputs absent, or no GTID/coordinate matches), or
+    :data:`FOREST_ENRICH_FAILED` (a genuine I/O error). The status, not the
+    point count, distinguishes a failure from a legitimate skip, so the caller
+    can abort segmentation when a tile that should have produced trees did not
+    rather than silently dropping it and caching a partial run as complete.
+
+    The output is always (re)written when reached: the global GTID map is
+    regenerated on every ``generalize_forest_ids`` call, so a forest.laz left
+    over from an earlier run with a different set of present tiles would carry
+    stale GTIDs that no longer match the freshly written gtid_map.
     """
     tile = TileLayout(tile_dir)
     name = tile_dir.name
@@ -58,37 +76,34 @@ def _write_forest_laz(tile_dir: Path, tile_map: pd.DataFrame, overwrite: bool) -
 
     if not veg_path.exists() or not seg_path.exists():
         logging.debug(f"[{name}] Missing vegetation or segmentation file — skipped.")
-        return name, 0
-    if out_forest.exists() and not overwrite:
-        logging.debug(f"[{name}] Forest already exists — skipped.")
-        return name, 0
+        return name, 0, FOREST_ENRICH_SKIPPED
     if tile_map.empty:
         logging.warning(f"[{name}] No GTIDs found for this tile — skipped.")
-        return name, 0
+        return name, 0, FOREST_ENRICH_SKIPPED
 
     # segmentation.xyz: whitespace-separated "tid x y z" produced by the C++
     # binary; keep the regex separator to tolerate its exact spacing.
     try:
         seg_df = pd.read_csv(seg_path, sep=r"\s+", header=None, names=["tid", "x", "y", "z"])
     except Exception as e:
-        logging.warning(f"[{name}] Failed reading segmentation.xyz: {e}")
-        return name, 0
+        logging.error(f"[{name}] Failed reading segmentation.xyz: {e}")
+        return name, 0, FOREST_ENRICH_FAILED
 
     # Attach gtid by tree id. tid is unique per tile, so this is a 1:1 lookup.
     seg_df = seg_df.merge(tile_map[["tid", "gtid"]], on="tid", how="inner")
     if seg_df.empty:
         logging.debug(f"[{name}] No matching GTIDs after merge — skipped.")
-        return name, 0
+        return name, 0, FOREST_ENRICH_SKIPPED
 
     try:
         with laspy.open(veg_path) as src:
             las = src.read()
     except Exception as e:
-        logging.warning(f"[{name}] Failed reading vegetation.laz: {e}")
-        return name, 0
+        logging.error(f"[{name}] Failed reading vegetation.laz: {e}")
+        return name, 0, FOREST_ENRICH_FAILED
     if len(las.points) == 0:
         logging.debug(f"[{name}] LAS has no coordinate data — skipped.")
-        return name, 0
+        return name, 0, FOREST_ENRICH_SKIPPED
 
     # The C++ segmentation output dropped the original point ordering, so the
     # gtid is recovered by matching exact (x, y, z) against the vegetation cloud.
@@ -96,7 +111,7 @@ def _write_forest_laz(tile_dir: Path, tile_map: pd.DataFrame, overwrite: bool) -
     merged = pd.merge(veg_df, seg_df[["x", "y", "z", "gtid"]], on=["x", "y", "z"], how="inner")
     if merged.empty:
         logging.debug(f"[{name}] No coordinate matches — skipped.")
-        return name, 0
+        return name, 0, FOREST_ENRICH_SKIPPED
 
     try:
         header = laspy.LasHeader(point_format=las.header.point_format, version=las.header.version)
@@ -110,27 +125,87 @@ def _write_forest_laz(tile_dir: Path, tile_map: pd.DataFrame, overwrite: bool) -
         las_out["gtid"] = merged["gtid"].astype(np.uint32).values
         las_out.write(out_forest)
     except Exception as e:
-        logging.warning(f"[{name}] Failed writing forest.laz: {e}")
-        return name, 0
+        logging.error(f"[{name}] Failed writing forest.laz: {e}")
+        return name, 0, FOREST_ENRICH_FAILED
 
     # Note: the happy-path "wrote N points" line is logged by the caller, not
     # here — spawned workers have no logging config, so an INFO emitted in the
     # worker would never reach the case log file in the parallel path.
-    return name, len(las_out.points)
+    return name, len(las_out.points), FOREST_ENRICH_WRITTEN
 
 
-def generalize_forest_ids(case: str, overwrite: bool = False, n_cores: int = 1) -> GeneralizeForestIdsResult:
+def _reconcile_cross_tile_duplicates(hulls: gpd.GeoDataFrame, min_iou: float = 0.5) -> gpd.GeoDataFrame:
+    """Drop near-duplicate hulls from one crown straddling a tile boundary.
+
+    Centroid ownership cannot dedup a crown wider than the halo margin: the
+    crown is truncated differently in each tile's clipped cloud and can segment
+    into one hull per straddled tile, each centroid landing in its own core
+    cell, so both pass the ownership gate and are kept (a silent double-count).
+    This catches them by geometry instead: cross-tile hull pairs that overlap
+    heavily (intersection-over-union ``>= min_iou``) are the same physical tree,
+    so keep the larger crown and drop the rest. Distinct neighbouring trees
+    barely touch and stay well below the threshold, so genuinely separate trees
+    are never merged.
+
+    Degrades to a no-op (returns *hulls* unchanged) on any geometry error, so a
+    reconciliation failure can never be worse than the pre-existing duplicate.
+    """
+    if len(hulls) < 2:
+        return hulls
+    try:
+        work = hulls.reset_index(drop=True)
+        areas = work.geometry.area.to_numpy()
+        pairs = gpd.sjoin(
+            work[["geometry", "tile_id"]],
+            work[["geometry", "tile_id"]],
+            how="inner",
+            predicate="intersects",
+        )
+        drop_idx: set[int] = set()
+        tile_ids = work["tile_id"].to_numpy()
+        geoms = work.geometry.to_numpy()
+        for left, right in zip(pairs.index.to_numpy(), pairs["index_right"].to_numpy(), strict=True):
+            if left >= right:
+                continue  # each unordered pair once; skip the self-match
+            if tile_ids[left] == tile_ids[right]:
+                continue  # same tile: tids are already unique, not a cross-tile dup
+            inter = geoms[left].intersection(geoms[right]).area
+            if inter <= 0:
+                continue
+            union = areas[left] + areas[right] - inter
+            if union <= 0 or inter / union < min_iou:
+                continue
+            drop_idx.add(int(right) if areas[left] >= areas[right] else int(left))
+        if drop_idx:
+            logging.info(
+                f"Cross-tile crown reconciliation: dropped {len(drop_idx)} duplicate hull(s) "
+                "from tree(s) straddling a tile boundary (crown wider than the halo margin)."
+            )
+            work = work.drop(index=sorted(drop_idx)).reset_index(drop=True)
+        return gpd.GeoDataFrame(work, crs=hulls.crs)
+    except Exception as e:
+        logging.warning(f"Cross-tile crown reconciliation skipped ({e}); proceeding without it.")
+        return hulls
+
+
+def generalize_forest_ids(case: str, n_cores: int = 1) -> GeneralizeForestIdsResult:
     """Create global tree IDs (GTIDs) and write forest.laz per tile.
 
     The per-tile `forest.laz` enrichment runs across `n_cores` worker processes
     (tiles are independent); pass ``n_cores=1`` for serial execution.
+
+    Every call recomputes the global GTID numbering and rewrites gtid_map.csv,
+    forest_hulls.geojson, and every present tile's forest.laz together, so the
+    three never drift apart (a partial re-run cannot leave a stale forest.laz
+    carrying GTIDs that no longer match the regenerated map).
 
     Raises
     ------
     MissingPrerequisiteError
         AOI file is missing or empty.
     StageFailureError
-        No tree hulls inside the AOI across any tile.
+        No tree hulls inside the AOI across any tile, or a tile that should
+        have produced trees failed to write its forest.laz.
     """
     cfg = get_config(case_name=case)
     layout = CaseLayout.from_config(cfg)
@@ -238,6 +313,12 @@ def generalize_forest_ids(case: str, overwrite: bool = False, n_cores: int = 1) 
     hulls = hulls.drop(columns="centroid")
     hulls = gpd.GeoDataFrame(hulls, crs=cfg["crs"])
 
+    # Geometric backstop to centroid ownership: a crown wider than the halo
+    # margin can survive as one hull per straddled tile, each owned by its own
+    # core cell. Merge those duplicates before numbering so the tree is counted
+    # (and reconstructed) once.
+    hulls = _reconcile_cross_tile_duplicates(hulls)
+
     # ------------------------------------------------------------------
     # Assign GTIDs sequentially
     # ------------------------------------------------------------------
@@ -267,6 +348,12 @@ def generalize_forest_ids(case: str, overwrite: bool = False, n_cores: int = 1) 
         for tile_dir in sorted(tiles_dir.iterdir())
     ]
 
+    # Collect a (tile_id, status) outcome per tile so a genuine enrichment
+    # failure (an I/O error, or a dead worker) aborts segmentation instead of
+    # being silently dropped — a missing forest.laz would otherwise surface
+    # downstream only as a non-fatal "missing_input" tile and be cached as
+    # complete.
+    outcomes: list[tuple[str, str]] = []
     if n_cores > 1 and len(tasks) > 1:
         logging.info(f"Enriching {len(tasks)} tiles with GTIDs across {n_cores} workers.")
         # Use a "spawn" context, not the default fork: this pool is created after
@@ -276,20 +363,29 @@ def generalize_forest_ids(case: str, overwrite: bool = False, n_cores: int = 1) 
         # fresh interpreter and sidesteps it — matching scripts/reconstruction.py.
         ctx = mp.get_context("spawn")
         with ProcessPoolExecutor(max_workers=n_cores, mp_context=ctx) as pool:
-            futures = {pool.submit(_write_forest_laz, td, tm, overwrite): td.name for td, tm in tasks}
+            futures = {pool.submit(_write_forest_laz, td, tm): td.name for td, tm in tasks}
             for fut in as_completed(futures):
                 name = futures[fut]
                 try:
-                    tname, n_pts = fut.result()
+                    tname, n_pts, status = fut.result()
+                    outcomes.append((tname, status))
                     if n_pts:
                         logging.info(f"[{tname}] Wrote forest.laz ({n_pts} points)")
                 except Exception as e:
-                    logging.warning(f"[{name}] forest.laz enrichment failed: {e}")
+                    # A worker that died (e.g. SIGKILL / BrokenProcessPool) never
+                    # returned a status; count it as a failure, not a skip.
+                    logging.error(f"[{name}] forest.laz enrichment worker failed: {e}")
+                    outcomes.append((name, FOREST_ENRICH_FAILED))
     else:
         for td, tm in tasks:
-            tname, n_pts = _write_forest_laz(td, tm, overwrite)
+            tname, n_pts, status = _write_forest_laz(td, tm)
+            outcomes.append((tname, status))
             if n_pts:
                 logging.info(f"[{tname}] Wrote forest.laz ({n_pts} points)")
+
+    failed = forest_enrichment_failures(outcomes)
+    if failed:
+        raise StageFailureError(f"forest.laz enrichment failed for {len(failed)} tile(s): {failed}")
 
     return GeneralizeForestIdsResult(
         n_trees=n_trees,

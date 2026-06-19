@@ -42,6 +42,17 @@ class AlphaWrapServerError(StageFailureError):
     """
 
 
+class AlphaWrapTimeoutError(AlphaWrapServerError):
+    """A single wrap exceeded the per-tree timeout (a genuine CGAL hang).
+
+    Distinct from the other failures because it is deterministic and
+    expensive: the same degenerate input re-hangs for the full timeout on
+    every resume. The worker retires the gtid permanently on this, rather than
+    letting it stall ``_WRAP_TIMEOUT_S`` again on the next run, while an
+    ordinary (fast) failure stays retryable.
+    """
+
+
 class AlphaWrapServer:
     """Persistent CGAL alpha-wrap coprocess (`awrap_points --server`).
 
@@ -174,7 +185,7 @@ class AlphaWrapServer:
         status = self._read_status()
         if status is None:
             self._kill()
-            raise AlphaWrapServerError(f"alpha wrap timed out after {self._timeout:.0f}s")
+            raise AlphaWrapTimeoutError(f"alpha wrap timed out after {self._timeout:.0f}s")
         if status == "":
             self._reap()
             raise AlphaWrapServerError("coprocess died during wrap")
