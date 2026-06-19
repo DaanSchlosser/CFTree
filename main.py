@@ -8,9 +8,11 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 
 from src.config import get_config, setup_logger
+from src.stages import StageError, StageFailureError
 
 _IS_POSIX = os.name == "posix"
 
@@ -28,7 +30,13 @@ def _terminate_process_group(process: subprocess.Popen) -> None:
 
 
 def run_stage(name: str, cmd: str) -> None:
-    """Run one pipeline stage and ensure cleanup of all workers if interrupted."""
+    """Run one pipeline stage, aborting the pipeline if the stage fails.
+
+    A non-zero stage exit raises :class:`StageFailureError` so the caller
+    stops rather than running the next stage on missing input and exiting
+    0. A clean exit returns normally. Interrupts and launch errors still
+    tear down the worker process group before propagating.
+    """
     start = time.time()
 
     # On POSIX, start subprocess in a new session so we can kill the whole
@@ -41,8 +49,6 @@ def run_stage(name: str, cmd: str) -> None:
 
     try:
         process.wait()
-        if process.returncode != 0:
-            logging.warning(f"{name} failed with exit code {process.returncode}")
     except KeyboardInterrupt:
         logging.warning(f"KeyboardInterrupt detected — terminating {name} and its workers...")
         _terminate_process_group(process)
@@ -52,11 +58,15 @@ def run_stage(name: str, cmd: str) -> None:
         _terminate_process_group(process)
         raise
 
+    if process.returncode != 0:
+        logging.error(f"{name} failed with exit code {process.returncode}")
+        raise StageFailureError(f"stage {name!r} exited with code {process.returncode}")
+
     elapsed = (time.time() - start) / 60
     logging.info(f"Finished {name} in {elapsed:.2f} min")
 
 
-def main():
+def main() -> int:
     start = time.time()  # <-- define start time
 
     # -------------------------------
@@ -139,7 +149,14 @@ def main():
     total_time = (time.time() - start) / 60
     logger.info(f"\n{banner_wide}Pipeline complete")
     logger.info(f"total elapsed time: {total_time:.2f} minutes")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except StageError as exc:
+        # A stage (or one of its tiles) failed. Exit non-zero so a caller
+        # never mistakes a partial run for a complete one.
+        logging.error(f"CFTree pipeline aborted: {exc}")
+        sys.exit(1)

@@ -15,6 +15,7 @@ Example:
 import argparse
 import json
 import logging
+import sys
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -28,7 +29,13 @@ from src.get_data.clip_tile import clip_tile
 from src.get_data.download_geotiles import download_tile
 from src.get_data.extract_dtm import compute_tile_dtm
 from src.get_data.tile_sources import TileSource, from_version
-from src.stages import MissingPrerequisiteError, RemoteUnavailableError, StageError, TileOutcome
+from src.stages import (
+    MissingPrerequisiteError,
+    RemoteUnavailableError,
+    StageError,
+    TileOutcome,
+    failed_statuses,
+)
 from src.tile_layout import CaseLayout
 
 
@@ -124,7 +131,7 @@ def run_sweep(
 # ---------------------------------------------------------------------
 # Runner main
 # ---------------------------------------------------------------------
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="Run get_data pipeline for a case.")
     parser.add_argument("--case", type=str, help="Case name (default from config)")
     parser.add_argument("--n-cores", type=int, default=None, help="Number of parallel workers (default from config)")
@@ -193,7 +200,7 @@ def main():
 
     if not tile_ids:
         logging.info("No intersecting tiles found.")
-        return
+        return 0
 
     logging.info(
         f"Found {len(tile_ids)} intersecting tiles: {tile_ids if len(tile_ids) <= 10 else tile_ids[:10] + ['...']}"
@@ -201,7 +208,7 @@ def main():
 
     if args.dry_run:
         logging.info("[DRY RUN] Exiting before downloads.")
-        return
+        return 0
 
     # ------------------------------------------------------------------
     # Step 3: download all tiles (barrier), then clip + DTM with a halo
@@ -218,12 +225,21 @@ def main():
     # tile's clip now reads its neighbours' raw clouds (the halo) — otherwise which
     # border points a clip sees would depend on download order (non-deterministic).
     logging.info(f"Downloading {len(tile_ids)} tiles ({n_cores} workers)...")
-    run_sweep(download_one, [(tid, output_dir, source, args.overwrite) for tid in tile_ids], n_cores)
+    download_outcomes = run_sweep(
+        download_one, [(tid, output_dir, source, args.overwrite) for tid in tile_ids], n_cores
+    )
+    download_failed = failed_statuses(o.status for o in download_outcomes)
 
     present = [tid for tid in tile_ids if layout.tile(tid).raw_laz.exists()]
     if not present:
-        logging.error("No tiles downloaded successfully; nothing to clip.")
-        return
+        # No raw clouds on disk. A genuine download failure exits non-zero;
+        # an AHN6 AOI entirely outside coverage (all "not_in_coverage") is a
+        # graceful skip, so it exits 0 with nothing to clip.
+        if download_failed:
+            logging.error(f"No tiles downloaded; {len(download_failed)} download failure(s).")
+            return 1
+        logging.info("No tiles downloaded (none in coverage); nothing to clip.")
+        return 0
     logging.info(f"{len(present)}/{len(tile_ids)} tiles downloaded; building halo clip regions.")
 
     # Build each tile's clip region (its core cell + halo margin, intersected with
@@ -267,9 +283,18 @@ def main():
     n_ok = sum(1 for o in outcomes if o.status == "ok")
     logging.info(f"Completed get_data for case: {case} — {n_ok}/{len(clip_tasks)} tiles clipped + DTM ok")
 
+    # Exit non-zero on any genuine download or clip/DTM failure (graceful
+    # "not_in_coverage" skips excluded), so the orchestrator aborts rather
+    # than feeding a partial tile set to segmentation and reconstruction.
+    failed = download_failed + failed_statuses(o.status for o in outcomes)
+    if failed:
+        logging.error(f"get_data failed: {len(failed)} stage failure(s): {failed}")
+        return 1
+    return 0
+
 
 # ---------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

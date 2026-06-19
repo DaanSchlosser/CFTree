@@ -14,13 +14,14 @@ Example:
 
 import argparse
 import logging
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from src.config import get_config, setup_logger
 from src.segmentation.generalize_forest_ids import generalize_forest_ids
 from src.segmentation.segment_tile import segment_tile
-from src.stages import MissingPrerequisiteError, StageError, TileOutcome
+from src.stages import MissingPrerequisiteError, StageError, TileOutcome, failed_statuses
 from src.tile_layout import CaseLayout, TileLayout
 from src.vegetation_filter.HOMED_vegetation_filter import filter_tile
 
@@ -59,7 +60,7 @@ def process_tile(tile_dir: Path, overwrite: bool = False) -> TileOutcome:
 # ---------------------------------------------------------------------
 # Runner main
 # ---------------------------------------------------------------------
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run vegetation filtering, segmentation, and forest ID generalization."
     )
@@ -89,18 +90,18 @@ def main():
     tiles_root = layout.tiles_dir
     if not tiles_root.exists():
         logging.error(f"Tiles directory not found: {tiles_root}")
-        return
+        return 1
 
     tile_dirs = sorted([p for p in tiles_root.iterdir() if TileLayout(p).clipped_laz.exists()])
     if not tile_dirs:
         logging.info("No clipped tiles found — nothing to process.")
-        return
+        return 0
 
     logging.info(f"Found {len(tile_dirs)} tiles for case {case}")
     if args.dry_run:
         for t in tile_dirs:
             logging.info(f"[DRY RUN] Would process tile: {t.name}")
-        return
+        return 0
 
     logging.info("=" * 80)
     logging.info("STEP 1–2: Vegetation Filtering and Segmentation")
@@ -109,6 +110,7 @@ def main():
     # ------------------------------------------------------------------
     # Parallel or serial execution
     # ------------------------------------------------------------------
+    statuses: list[str] = []
     if n_cores > 1:
         logging.info(f"Running in parallel with {n_cores} cores.")
         with ProcessPoolExecutor(max_workers=n_cores) as pool:
@@ -117,13 +119,16 @@ def main():
                 tid = futures[fut]
                 try:
                     result = fut.result()
+                    statuses.append(result.status)
                     logging.info(f"[{tid}] {result.status.upper()}")
                 except Exception as e:
+                    statuses.append("exception")
                     logging.warning(f"[{tid}] Exception: {e}")
     else:
         logging.info("Running in serial mode.")
         for td in tile_dirs:
             result = process_tile(td, args.overwrite)
+            statuses.append(result.status)
             logging.info(f"[{td.name}] {result.status.upper()}")
 
     logging.info("=" * 80)
@@ -133,6 +138,7 @@ def main():
     # ------------------------------------------------------------------
     # Step 3: Forest generalization
     # ------------------------------------------------------------------
+    generalize_ok = True
     try:
         out_forest_hulls = layout.forest_hulls
         out_gtid_map = layout.gtid_map
@@ -161,16 +167,30 @@ def main():
 
     except StageError as e:
         logging.error(f"Forest generalization failed: {e}")
+        generalize_ok = False
     except Exception as e:
         logging.exception(f"Forest generalization unexpected error: {e}")
+        generalize_ok = False
 
     logging.info("=" * 80)
     logging.info(f"Completed tree segmentation pipeline for case: {case}")
     logging.info("=" * 80)
+
+    # Exit non-zero when any tile failed segmentation, or forest
+    # generalization failed, so the orchestrator aborts rather than letting a
+    # partial segmentation feed reconstruction and be cached as complete.
+    failed = failed_statuses(statuses)
+    if failed or not generalize_ok:
+        logging.error(
+            f"Segmentation failed: {len(failed)} tile failure(s) {failed}; "
+            f"forest generalization {'ok' if generalize_ok else 'failed'}"
+        )
+        return 1
+    return 0
 
 
 # ---------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

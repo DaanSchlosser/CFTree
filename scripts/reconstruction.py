@@ -45,6 +45,7 @@ import multiprocessing as mp
 import os
 import pickle
 import shutil
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -551,7 +552,7 @@ def _run_tile(
 # ---------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="Run 3D tree reconstruction (Step 3)")
     parser.add_argument("--case", type=str, help="Case name (default from config if omitted)")
     parser.add_argument(
@@ -599,12 +600,12 @@ def main():
     tiles_root = CaseLayout.from_config(cfg).tiles_dir
     if not tiles_root.exists():
         logging.error(f"No tiles found at {tiles_root}")
-        return
+        return 1
 
     tile_dirs = [p for p in tiles_root.iterdir() if p.is_dir()]
     if args.dry_run:
         logging.info(f"Dry run — found {len(tile_dirs)} tiles")
-        return
+        return 0
 
     results = []
     with ThreadPoolExecutor(max_workers=n_cores) as ex:
@@ -636,11 +637,15 @@ def main():
     logging.info(f"Reconstruction summary: {len(ok)}/{len(results)} ok")
     if failed:
         failed_summary = ", ".join(f"{r['tile_id']}({r['status']})" for r in failed)
-        logging.warning(f"{len(failed)} tile(s) failed: {failed_summary}")
+        logging.error(f"{len(failed)} tile(s) failed: {failed_summary}")
     if other:
         other_summary = ", ".join(f"{r['tile_id']}({r['status']})" for r in other)
         logging.info(f"{len(other)} tile(s) other: {other_summary}")
 
+    # Exit non-zero when any tile failed reconstruction, so the orchestrator
+    # aborts rather than letting a partial tree set be cached as complete.
+    return 1 if failed else 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

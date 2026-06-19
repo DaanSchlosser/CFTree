@@ -23,6 +23,7 @@ the interface is now typed end-to-end and failure modes are distinguishable.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -140,3 +141,43 @@ class TileOutcome:
     status: str  # "ok" | "not_in_coverage" | "missing_input" | "failed" | ...
     paths: dict[str, Path] = field(default_factory=dict)
     detail: str | None = None
+
+
+# ---------------------------------------------------------------------
+# Failure classification (single source of truth for stage exit codes)
+# ---------------------------------------------------------------------
+# A stage's `main()` exits non-zero when its tile outcomes include any of
+# these, so the orchestrator (`main.py::run_stage`) aborts the pipeline
+# instead of letting a downstream consumer cache a partial run as complete.
+# Successes ("ok", "downloaded", "complete", "chunk_done", "exists") and
+# graceful skips are deliberately NOT failures: "not_in_coverage" is an AHN6
+# coverage gap (an expected skip, not an error), and "empty_tile" is a tile
+# with no trees (a valid result). Reconstruction's "missing_input" /
+# "invalid_input" are likewise left non-fatal, matching that stage's own
+# ok/failed/other split, so this set never reclassifies an existing outcome.
+FAILURE_STATUSES: frozenset[str] = frozenset(
+    {
+        "download_failed",
+        "clip_failed",
+        "dtm_failed",
+        "clip_prereq_missing",
+        "veg_failed",
+        "veg_prereq_missing",
+        "seg_failed",
+        "seg_prereq_missing",
+        "exception",
+        "failed",
+        "stalled",
+        "failed_max_attempts",
+    }
+)
+
+
+def failed_statuses(statuses: Iterable[str]) -> list[str]:
+    """Return the genuine-failure statuses present in *statuses*.
+
+    Empty when every tile succeeded or was gracefully skipped, so a stage
+    can ``sys.exit(1 if failed_statuses(...) else 0)`` and an AHN6 run with
+    out-of-coverage tiles still exits 0. See :data:`FAILURE_STATUSES`.
+    """
+    return [s for s in statuses if s in FAILURE_STATUSES]
