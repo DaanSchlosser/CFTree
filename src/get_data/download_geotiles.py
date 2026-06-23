@@ -5,6 +5,7 @@
 # src/get_data/download_geotiles.py
 
 import logging
+import time
 from pathlib import Path
 
 import requests
@@ -13,8 +14,20 @@ from src.get_data.tile_sources import TileSource
 from src.stages import DownloadResult, RemoteUnavailableError, StageFailureError
 from src.tile_layout import CaseLayout
 
-_REQUEST_TIMEOUT = 30  # connect/read seconds
+# A short connect timeout still fast-fails a genuinely unreachable host, but the
+# read timeout has to be generous. The GeoTiles host can stall ~20 s staging a
+# cold tile before the first byte, and the AHN LAZ sub-tiles are ~190 MB, so a
+# tight read timeout drops large downloads under concurrent load (a single
+# value would apply to both connect and read).
+_CONNECT_TIMEOUT = 15  # seconds to establish the connection
+_READ_TIMEOUT = 120  # seconds to wait for the next streamed chunk (or first byte)
+_REQUEST_TIMEOUT = (_CONNECT_TIMEOUT, _READ_TIMEOUT)
 _CHUNK_SIZE = 1 << 20  # 1 MiB streaming chunks
+# A cold tile often stalls on the first hit and then serves from a warm cache,
+# so a few linear-backoff retries recover a transient GeoTiles stall rather than
+# failing the whole acquisition stage.
+_DOWNLOAD_ATTEMPTS = 3
+_RETRY_BACKOFF_S = 5  # multiplied by the attempt number
 
 
 def download_tile(
@@ -115,12 +128,44 @@ def _ensure_file(
 
 
 def _stream_download(url: str, dest: Path) -> None:
-    """Download `url` to `dest` atomically: write to .part, then rename."""
+    """Download `url` to `dest` atomically: write to .part, then rename.
+
+    A transient connection or timeout failure is retried a few times with linear
+    backoff, because the GeoTiles host can stall staging a cold tile and the LAZ
+    sub-tiles are large, so a single attempt drops mid-stream under load. HTTP
+    status errors (403/404 out of coverage, other 4xx/5xx) are not transient, so
+    they are not retried and propagate to `_ensure_file` on the first attempt.
+    The partial `.part` file is removed between attempts, so each retry starts
+    clean and a final failure leaves nothing behind.
+    """
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with requests.get(url, stream=True, allow_redirects=True, timeout=_REQUEST_TIMEOUT) as r:
-        r.raise_for_status()
-        with tmp.open("wb") as f:
-            for chunk in r.iter_content(chunk_size=_CHUNK_SIZE):
-                if chunk:
-                    f.write(chunk)
-    tmp.replace(dest)
+    for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+        try:
+            with requests.get(
+                url, stream=True, allow_redirects=True, timeout=_REQUEST_TIMEOUT
+            ) as r:
+                r.raise_for_status()
+                with tmp.open("wb") as f:
+                    for chunk in r.iter_content(chunk_size=_CHUNK_SIZE):
+                        if chunk:
+                            f.write(chunk)
+            tmp.replace(dest)
+            return
+        except requests.HTTPError:
+            # Not transient (e.g. 403/404 out of coverage); let the caller decide.
+            tmp.unlink(missing_ok=True)
+            raise
+        except (
+            requests.ConnectionError,
+            requests.Timeout,
+            requests.ChunkedEncodingError,
+        ) as e:
+            tmp.unlink(missing_ok=True)
+            if attempt == _DOWNLOAD_ATTEMPTS:
+                raise
+            wait = _RETRY_BACKOFF_S * attempt
+            logging.info(
+                f"Download stalled ({e.__class__.__name__}); "
+                f"retrying {attempt + 1}/{_DOWNLOAD_ATTEMPTS} in {wait}s"
+            )
+            time.sleep(wait)
