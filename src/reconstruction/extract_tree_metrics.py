@@ -18,6 +18,7 @@ Returns a `TreeMetrics` dataclass. Undefined sub-metrics are encoded as `NaN`
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +29,22 @@ from rasterio import mask
 from scipy.spatial import ConvexHull, cKDTree
 from shapely.geometry import Polygon
 
+from src.reconstruction import gpu_metrics
 from src.stages import StageFailureError, TreeMetrics
+
+
+def _gpu_metrics_enabled() -> bool:
+    """True when CFTREE_GPU_METRICS is set and a usable CUDA device is present.
+
+    The flag is opt-in (default off) so the embree / cKDTree path stays the
+    baseline until the GPU path has been validated against it on the target
+    machine via ``scripts/bench_morphometrics.py``. ``gpu_available`` caches the
+    Warp runtime init, so calling this per tree is cheap.
+    """
+    val = os.environ.get("CFTREE_GPU_METRICS", "").strip().lower()
+    if val not in {"1", "true", "yes", "on"}:
+        return False
+    return gpu_metrics.gpu_available()
 
 
 # ---------------------------------------------------------------------
@@ -286,9 +302,15 @@ def compute_tree_metrics(
         logging.debug(f"Trunk dimensions: H={H_m:.3f}, DBH={DBH_m:.3f}, r_trunk={r_trunk:.3f}")
 
         if compute_semantics:
-            r50_m = _compute_r50(crown_mesh, pts_xyz)
+            use_gpu = _gpu_metrics_enabled()
+            # r50 is computed first because porosity's voxel size derives from it.
+            r50_m = gpu_metrics.gpu_r50(crown_mesh, pts_xyz) if use_gpu else None
+            if r50_m is None:
+                r50_m = _compute_r50(crown_mesh, pts_xyz)
             voxel_size = r50_m * 0.8 if np.isfinite(r50_m) and r50_m > 0 else 0.25
-            porosity = _compute_porosity(crown_mesh, pts_xyz, voxel_size=voxel_size)
+            porosity = gpu_metrics.gpu_porosity(crown_mesh, pts_xyz, voxel_size=voxel_size) if use_gpu else None
+            if porosity is None:
+                porosity = _compute_porosity(crown_mesh, pts_xyz, voxel_size=voxel_size)
             logging.debug(f"r50={r50_m:.3f}, porosity={porosity:.3f}")
         else:
             # Geometry-only: skip the expensive descriptive metrics entirely.

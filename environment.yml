@@ -61,6 +61,16 @@ dependencies:
       # allocates many GB on moderate inputs (causes OOM in reconstruction).
       # The 2.17.7.post* line wraps embree 2.17.7 (the conda-forge version).
       - embreex==2.17.7.post7
+      # GPU acceleration of the two dominant per-tree morphometrics (r50 and
+      # porosity), used by src/reconstruction/gpu_metrics.py and enabled with
+      # CFTREE_GPU_METRICS=1. The GPU-accelerated part is the watertight
+      # inside/outside test (Warp winding number); the r50 nearest-neighbour
+      # query stays on scipy's cKDTree, so Warp is the only GPU dependency.
+      # warp-lang bundles its own CUDA components (no CUDA toolkit needed in the
+      # image; an NVIDIA driver plus, for Docker, the nvidia-container-toolkit on
+      # the host is enough) and falls back to CPU. On a machine with no NVIDIA
+      # GPU it installs fine and gpu_metrics.gpu_available() returns False.
+      - warp-lang
       # - cityjson
       # - pycityjson
       # - pdal-plugins
