@@ -17,17 +17,23 @@ conventions, N callers that don't.
 
 from __future__ import annotations
 
+import hashlib
+import os
+import tempfile
 from pathlib import Path
 
 from src.config import ResolvedConfig
 
 
 class TileCacheLayout:
-    """Per-tile reconstruction cache (`<tile_dir>/_cache/`).
+    """Per-tile reconstruction scratch cache.
 
     Holds the chunk-recycling state used by `scripts/reconstruction.py`:
     in-flight markers, the skipped-gtid list, per-tree intermediate
     point clouds and meshes, and finalized pickled tree results.
+
+    The root is resolved by `TileLayout.cache` to a fast local scratch
+    directory rather than the tile's own folder; see that property for why.
     """
 
     def __init__(self, root: Path) -> None:
@@ -113,7 +119,29 @@ class TileLayout:
 
     @property
     def cache(self) -> TileCacheLayout:
-        return TileCacheLayout(self.dir / "_cache")
+        """Per-tile reconstruction scratch cache, on a fast local filesystem.
+
+        The cache is fsync-heavy (a per-tree in-flight marker plus an atomic
+        pkl write per tree) and ephemeral (deleted on success). Writing it under
+        the tile's own folder puts that churn on whatever filesystem holds the
+        data root, which for the two common runners is a slow virtualized mount:
+        the WSL ``/mnt/c`` 9p share and the Docker bind-mount of a Windows path.
+        Measured on a Leiden tile that alone cost ~7x in reconstruction wall
+        time, with byte-identical output. So the cache is placed on local scratch
+        instead: ``CFTREE_SCRATCH`` if set, otherwise the system temp directory
+        (ext4/tmpfs under WSL, the container's own overlay under Docker, local
+        disk natively).
+
+        The location is a deterministic function of the tile's absolute path, so
+        the orchestrator and its spawned workers resolve the same directory, and
+        two tiles (or two cases that share a tile id) never collide. Only the
+        final CityJSON stays in the data dir; a resume after a reboot that wipes
+        temp recomputes from scratch, which is acceptable because the cache is
+        deleted on a successful run anyway.
+        """
+        base = os.environ.get("CFTREE_SCRATCH") or tempfile.gettempdir()
+        key = hashlib.md5(str(self.dir.resolve()).encode("utf-8")).hexdigest()[:12]
+        return TileCacheLayout(Path(base) / "cftree_cache" / f"{self.tile_id}_{key}")
 
 
 class CaseLayout:
