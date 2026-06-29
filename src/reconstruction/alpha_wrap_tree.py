@@ -23,6 +23,7 @@ import select
 import subprocess
 from pathlib import Path
 
+from src.config import resolve_native_binary
 from src.stages import AlphaWrapResult, MissingPrerequisiteError, StageFailureError
 
 # A single alpha-wrap of a ~1000-point tree takes a few milliseconds; this
@@ -82,7 +83,9 @@ class AlphaWrapServer:
     """
 
     def __init__(self, binary_path: Path | None = None, timeout: float = _WRAP_TIMEOUT_S) -> None:
-        self._binary = binary_path or Path(__file__).parent / "AlphaWrap" / "build" / "awrap_points"
+        self._binary = binary_path or resolve_native_binary(
+            Path(__file__).parent / "AlphaWrap" / "build" / "awrap_points"
+        )
         self._timeout = timeout
         self._proc: subprocess.Popen[str] | None = None
 

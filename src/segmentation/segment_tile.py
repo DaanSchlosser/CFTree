@@ -23,7 +23,7 @@ import geopandas as gpd
 import pandas as pd
 from shapely.geometry import MultiPoint
 
-from src.config import get_config
+from src.config import get_config, resolve_native_binary
 from src.stages import MissingPrerequisiteError, SegmentationResult, StageFailureError
 from src.tile_layout import TileLayout
 
@@ -52,7 +52,7 @@ def segment_tile(tile_dir: Path, overwrite: bool = False) -> SegmentationResult:
     output_xyz = tile.segmentation_xyz
     hulls_geojson = tile.tree_hulls
 
-    exe = Path(__file__).parent / "TreeSeparation" / "build" / "segmentation"
+    exe = resolve_native_binary(Path(__file__).parent / "TreeSeparation" / "build" / "segmentation")
 
     if not input_xyz.exists():
         raise MissingPrerequisiteError(f"[{tile_id}] Missing input vegetation.xyz at {input_xyz}")

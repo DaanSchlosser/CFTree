@@ -1,0 +1,35 @@
+# Keep the build context small and the image clean. The image rebuilds the C++
+# binaries from source, so host build artifacts and the large data/ tree are
+# excluded; resources/ and the small tracked cases are kept (they ship with a
+# clone and are useful for an in-image smoke test).
+.git
+.gitignore
+.github
+
+# Large local outputs and scratch
+data/
+results/
+tmp/
+.tmp_*
+
+# Host C++ build artifacts (the image compiles its own; see .gitignore)
+src/**/build/
+src/**/CMakeFiles/
+src/**/CMakeCache.txt
+src/**/cmake_install.cmake
+src/**/Makefile
+
+# Python caches and envs
+**/__pycache__/
+*.pyc
+*.pyo
+.venv/
+.vscode/
+.idea/
+
+# Logs, secrets, docs images
+*.log
+nohup.out
+.env
+cases/*/logs/
+docs/img/

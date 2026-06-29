@@ -9,6 +9,7 @@ Central configuration for the CFTree pipeline.
 """
 
 import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict
@@ -124,6 +125,28 @@ def get_config(case_name: str | None = None, n_cores: int | None = None) -> Reso
         "case_path": case_root / case_name,
         "data_case_path": data_case_path,
     }
+
+
+# ---------------------------------------------------------------------
+# Native binary resolution
+# ---------------------------------------------------------------------
+def resolve_native_binary(default: Path) -> Path:
+    """Resolve a compiled C++ binary, honouring the ``CFTREE_BIN`` override.
+
+    The two pipeline binaries (``awrap_points`` and ``segmentation``)
+    normally live in the ``build/`` directory next to their source, which
+    is where the local build writes them. When ``CFTREE_BIN`` is set, the
+    binary of the same name under that directory is used instead.
+
+    The override exists for the container image. The image bakes the
+    binaries at a fixed path outside the working tree, so a bind-mounted
+    source checkout, which carries no ``build/`` outputs, still resolves
+    them. With the variable unset the behaviour is exactly as before.
+    """
+    override = os.environ.get("CFTREE_BIN")
+    if override:
+        return Path(override) / default.name
+    return default
 
 
 # ---------------------------------------------------------------------
