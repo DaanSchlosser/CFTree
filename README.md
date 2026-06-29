@@ -81,6 +81,121 @@ conda activate cftree
 
 > **NOTE:** Creating the environment may take a while, don't worry!
 
+## Run with Docker
+
+The Docker image bakes the conda environment and the two compiled C++ binaries,
+so a colleague runs CFTree without a manual WSL setup, a conda environment, or a
+C++ toolchain. The only prerequisites are Docker and a clone of this repository.
+
+Build the image once:
+
+```bash
+docker build -t cftree:local .
+```
+
+Then run a case by bind-mounting your checkout at `/work`, which keeps `cases/`
+and `data/` on the host so the outputs land next to the source as usual:
+
+```bash
+docker run --rm -v "$PWD":/work cftree:local \
+    python main.py --case wippolder --ahn-version 6 --n-cores 8 --buffer 20 --overwrite
+```
+
+The compiled binaries are baked at `/opt/cftree/bin` inside the image and are
+found through the `CFTREE_BIN` environment variable, so the bind-mounted checkout
+resolves them even though a clone carries no `build/` outputs. On Windows and
+macOS the build context excludes `data/`, so a large local `data/` directory does
+not slow the build.
+
+The CityGML/Energy ADE creator drives this image directly through its docker
+runner. Set `CFTREE_RUNNER=docker` and `CFTREE_IMAGE=cftree:local` in that
+project's `.env`; the creator then bind-mounts the checkout and runs the image
+for each area of interest.
+
+The image embeds CGAL alpha-wrap (GPL-3.0) and the TreeSeparation binary, so the
+image is a GPL-3.0 distribution, consistent with this repository's licence.
+
+## Performance: scratch cache and parallel reconstruction
+
+Two changes dominate reconstruction wall time, and both apply to every run
+including `--geometry-only` (where the descriptive metrics below are skipped).
+
+The per-tree cache is fsync-heavy (an in-flight marker plus an atomic pickle per
+tree) and ephemeral (it is deleted once a tile finishes). Writing it next to the
+data put that churn on whatever filesystem holds the data root, which for the two
+common runners is a slow virtualized mount, the WSL `/mnt/c` 9p share and the
+Docker bind-mount of a Windows path. The cache now goes to a fast local directory
+instead, `CFTREE_SCRATCH` if set and the system temp directory otherwise (ext4 or
+tmpfs under WSL, the container's own overlay under Docker). On a Leiden 400 m area
+this alone took reconstruction from about 96 s to about 14 s with byte-identical
+output, and the container gets it for free because its temp directory is not the
+bind-mount. Only the final CityJSON is written to the data directory.
+
+Reconstruction also runs all tiles' trees through one global queue of work
+batches, so up to `--n-cores` worker subprocesses stay busy regardless of how the
+trees are distributed. A single tile with thousands of trees is split into many
+batches that run in parallel rather than one sequential stream, and a handful of
+small tiles no longer leave most cores idle. On a 1000 m area whose largest tile
+holds about 2400 trees, reconstruction went from about 117 s to about 37 s at
+`--n-cores 8` and about 29 s at `--n-cores 16`, again byte-identical. Each worker
+holds up to `--chunk-size` trees in memory, so size `--n-cores` to RAM; a
+geometry-only worker is lighter than a full-metric one.
+
+## Performance: GPU morphometrics
+
+This lever helps full-semantic runs only. It has no effect under
+`--geometry-only`, which skips the two metrics described here.
+
+The two descriptive metrics computed per tree, `r50` and `porosity`, account for
+the large majority of reconstruction time. `r50` is a voxelization plus a
+nearest-neighbour query, and `porosity` is an inside/outside test of a voxel grid
+against the crown mesh. The expensive shared step is the watertight inside/outside
+test, and that is what moves to the GPU through an NVIDIA Warp winding-number
+query (valid because the alpha-wrapped crown is watertight). The r50
+nearest-neighbour query stays on scipy's k-d tree, which is faster than a GPU
+brute force at these small per-tree point counts, so Warp is the only GPU
+dependency.
+
+The GPU path is opt-in and off by default. Enable it with `CFTREE_GPU_METRICS=1`
+on a machine with a CUDA-capable NVIDIA GPU; without one, or if any GPU step
+fails, the run falls back to the existing CPU path with no change in output.
+
+```bash
+# inside the cftree env or the container, with a GPU present
+CFTREE_GPU_METRICS=1 python main.py --case wippolder --ahn-version 6 --n-cores 8 --buffer 20 --overwrite
+```
+
+In the container, pass the GPU through and set the flag:
+
+```bash
+docker run --rm --gpus all -e CFTREE_GPU_METRICS=1 -v "$PWD":/work cftree:local \
+    python main.py --case wippolder --ahn-version 6 --n-cores 8 --buffer 20 --overwrite
+```
+
+`--gpus all` needs an NVIDIA driver on the host and the nvidia-container-toolkit,
+which Docker Desktop provides through its WSL2 backend.
+
+Before enabling the GPU path on real data, validate it against the CPU baseline.
+The benchmark harness times the two metrics and diffs the GPU result against the
+CPU result per tree, failing if either drifts beyond tolerance:
+
+```bash
+# synthetic crowns, no pipeline data needed
+python -m scripts.bench_morphometrics --synthetic --n-trees 50
+```
+
+A `PASS` line confirms the GPU output matches the CPU output within tolerance and
+reports the measured speedup. The GPU path accelerates the descriptive metrics
+only; the crown and trunk geometry is produced by the same CGAL alpha-wrap and is
+unchanged.
+
+On a laptop RTX 4070 the morphometrics ran about twice as fast end to end and
+roughly three times as fast per tree once the one-time Warp kernel compile is
+amortized, with the metric values matching the CPU baseline. The reconstruction
+workers share one GPU, so on a small card a very high `--n-cores` can crowd GPU
+memory; a moderate value is enough because the GPU already parallelizes the
+per-tree work.
+
 ## Quickstart Example
 
 ### 1. Define your area of interest in:

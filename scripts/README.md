@@ -151,9 +151,13 @@ Generates watertight 3D tree geometries (crown + trunk) for CFD analysis.
 per tile:
 ``` bash
 trees_lod3.city.json    # final output file, ready for CFD-use
-_cache/ (temporary)     # temporary per-tree point cloud in local coordinates, removed after processing
-
 ```
+
+A temporary per-tile scratch cache (per-tree point clouds, meshes and pickled
+results) is written to a fast local directory, not next to the data: `CFTREE_SCRATCH`
+if set, otherwise the system temp directory. It is removed after a tile finishes
+(keep it with `--keep-cache`). Keeping this fsync-heavy cache off a slow mount
+(the WSL `/mnt/c` path or a Docker bind-mount) is a large reconstruction speedup.
 
 ### Optional flags:
 | Flag           | Type   | Description                                   |
