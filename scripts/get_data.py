@@ -147,6 +147,45 @@ def clip_and_dtm(
     return TileOutcome(tile_id=tile_id, status="ok", paths={"clipped": clip.clipped, "dtm": dtm.dtm})
 
 
+def acquire_clip_dtm_one(
+    tile_id: str,
+    output_dir: Path,
+    source: TileSource,
+    region: Polygon,
+    overwrite: bool,
+    crs: str,
+) -> TileOutcome:
+    """Fused per-tile pipeline for a self-contained source: acquire, clip, DTM.
+
+    Used when the source's tiles overlap enough to carry their own halo (GeoTiles
+    AHN4/AHN5), so a tile's clip needs only its own cloud and can start the moment
+    that tile is fetched, with no acquire/clip barrier. Different tiles then overlap
+    one tile's clip/DTM (CPU) with another's fetch (network). The clip is a single
+    input, matching the self-contained branch of the two-sweep path.
+    """
+    try:
+        if source.acquire_mode == "lax":
+            read_region(tile_id, output_dir, source, region, overwrite=overwrite)
+        else:
+            download_tile(tile_id, output_dir, source, overwrite=overwrite)
+    except RemoteUnavailableError as e:
+        logging.info(f"[{tile_id}] Skipped: {e}")
+        return TileOutcome(tile_id=tile_id, status="not_in_coverage", detail=str(e))
+    except StageError as e:
+        logging.warning(f"[{tile_id}] Region read failed: {e}")
+        return TileOutcome(tile_id=tile_id, status="download_failed", detail=str(e))
+
+    tile = CaseLayout(data_dir=output_dir).tile(tile_id)
+    if not tile.raw_laz.exists():  # a graceful skip produced no cloud for this region
+        return TileOutcome(tile_id=tile_id, status="not_in_coverage", detail="no raw cloud for region")
+    try:
+        gpd.GeoDataFrame(geometry=[region], crs=crs).to_file(tile.clip_region, driver="GeoJSON")
+    except Exception as e:  # noqa: BLE001
+        logging.warning(f"[{tile_id}] Could not write clip region: {e}")
+        return TileOutcome(tile_id=tile_id, status="clip_failed", detail=str(e))
+    return clip_and_dtm(tile_id, output_dir, [tile.raw_laz], overwrite)
+
+
 def run_sweep(
     worker: Callable[..., TileOutcome],
     tasks: list[tuple],
@@ -261,7 +300,7 @@ def main() -> int:
         return 0
 
     # ------------------------------------------------------------------
-    # Step 3: acquire all tiles (barrier), then clip + DTM with a halo
+    # Step 3: acquire each tile's points, then clip + DTM with a halo
     # ------------------------------------------------------------------
     margin = args.halo_margin
     if args.buffer < margin:
@@ -273,80 +312,89 @@ def main() -> int:
 
     buffered_geom = aoi.union_all()
 
-    # Sweep 1: acquire every tile's points. Must finish before any clip starts,
-    # because a tile's clip reads its neighbours' clouds (the halo) — otherwise
-    # which border points a clip sees would depend on acquisition order
-    # (non-deterministic). A streaming (COPC) source range-reads only each tile's
-    # AOI region from the remote file; a whole-file source (GeoTiles) downloads
-    # the cell into the shared tile cache.
-    if source.is_streaming:
-        logging.info(f"Range-reading {len(tile_ids)} tile region(s) ({n_cores} workers)...")
+    if source.self_contained_halo:
+        # Overlapping source (GeoTiles AHN4/AHN5): each tile carries its own halo
+        # within its own cloud, so there is no need to acquire every tile before
+        # clipping any. Run a fused acquire -> clip -> DTM per tile with no barrier,
+        # so one tile's clip/DTM (CPU) overlaps another's fetch (network).
+        logging.info(f"Acquiring + clipping {len(tile_ids)} tile(s) in one pass ({n_cores} workers)...")
         read_cells = {tid: source.core_cell(tid) for tid in tile_ids}
-        stream_tasks = [
-            (tid, output_dir, source, tile_clip_region(read_cells[tid], margin, buffered_geom), args.overwrite)
+        tasks = [
+            (
+                tid,
+                output_dir,
+                source,
+                tile_clip_region(read_cells[tid], margin, buffered_geom),
+                args.overwrite,
+                cfg["crs"],
+            )
             for tid in tile_ids
         ]
-        download_outcomes = run_sweep(stream_one, stream_tasks, n_cores)
+        outcomes = run_sweep(acquire_clip_dtm_one, tasks, n_cores)
+        download_failed: list[str] = []  # acquisition failures fold into `outcomes`
     else:
-        logging.info(f"Downloading {len(tile_ids)} tiles ({n_cores} workers)...")
-        download_outcomes = run_sweep(
-            download_one, [(tid, output_dir, source, args.overwrite) for tid in tile_ids], n_cores
-        )
-    download_failed = failed_statuses(o.status for o in download_outcomes)
+        # Hard-partitioned source (AHN6 COPC): a tile's clip reads its neighbours'
+        # clouds to fill the halo, so acquisition must finish for ALL tiles before
+        # any clip starts (a barrier) or which border points a clip sees would
+        # depend on acquisition order (non-deterministic). The streaming source
+        # range-reads only each tile's AOI region from the remote file.
+        if source.is_streaming:
+            logging.info(f"Range-reading {len(tile_ids)} tile region(s) ({n_cores} workers)...")
+            read_cells = {tid: source.core_cell(tid) for tid in tile_ids}
+            acquire_tasks = [
+                (tid, output_dir, source, tile_clip_region(read_cells[tid], margin, buffered_geom), args.overwrite)
+                for tid in tile_ids
+            ]
+            download_outcomes = run_sweep(stream_one, acquire_tasks, n_cores)
+        else:
+            logging.info(f"Downloading {len(tile_ids)} tiles ({n_cores} workers)...")
+            download_outcomes = run_sweep(
+                download_one, [(tid, output_dir, source, args.overwrite) for tid in tile_ids], n_cores
+            )
+        download_failed = failed_statuses(o.status for o in download_outcomes)
 
-    present = [tid for tid in tile_ids if layout.tile(tid).raw_laz.exists()]
-    if not present:
-        # No raw clouds on disk. A genuine download failure exits non-zero;
-        # an AHN6 AOI entirely outside coverage (all "not_in_coverage") is a
-        # graceful skip, so it exits 0 with nothing to clip.
-        if download_failed:
-            logging.error(f"No tiles downloaded; {len(download_failed)} download failure(s).")
-            return 1
-        logging.info("No tiles downloaded (none in coverage); nothing to clip.")
-        return 0
-    logging.info(f"{len(present)}/{len(tile_ids)} tiles downloaded; building halo clip regions.")
+        present = [tid for tid in tile_ids if layout.tile(tid).raw_laz.exists()]
+        if not present:
+            # No raw clouds on disk. A genuine download failure exits non-zero; an
+            # AHN6 AOI entirely outside coverage (all "not_in_coverage") is a
+            # graceful skip, so it exits 0 with nothing to clip.
+            if download_failed:
+                logging.error(f"No tiles downloaded; {len(download_failed)} download failure(s).")
+                return 1
+            logging.info("No tiles downloaded (none in coverage); nothing to clip.")
+            return 0
+        logging.info(f"{len(present)}/{len(tile_ids)} tiles downloaded; building halo clip regions.")
 
-    # Build each tile's clip region (its core cell + halo margin, intersected with
-    # the buffered AOI) and the neighbour raw clouds needed to fill it.
-    cells = {tid: source.core_cell(tid) for tid in present}
-    # A hard-partitioned source (AHN6 COPC) stops each raw at the cell edge, so a
-    # tile's halo band is filled from the (disjoint) neighbour cells: pull a
-    # neighbour for the part of the region the tile's OWN raw does not cover, read
-    # from each raw's actual extent (the LAZ header bbox). An overlapping,
-    # self-contained source (GeoTiles AHN4/AHN5) already carries its halo within a
-    # single tile's own cloud (the margin stays within the inter-tile overlap), so
-    # it clips one input. Merging overlapping neighbours there would DUPLICATE the
-    # shared boundary points, so it must stay single-input regardless of the raw's
-    # exact bbox (a partial range read trims the raw to ~the region, which would
-    # otherwise trip a bbox-based "missing" test on edge slivers).
-    need_neighbours = not source.self_contained_halo
-    raw_bbox: dict[str, Polygon] = {}
-    if need_neighbours:
+        # Build each tile's clip region (its core cell + halo margin, intersected
+        # with the buffered AOI) and the neighbour raw clouds needed to fill it.
+        # A hard-partitioned raw stops at the cell edge, so pull a neighbour for the
+        # part of the region the tile's OWN raw (its LAZ header bbox) does not cover.
+        cells = {tid: source.core_cell(tid) for tid in present}
+        raw_bbox: dict[str, Polygon] = {}
         for tid in present:
             with laspy.open(layout.tile(tid).raw_laz) as f:
                 h = f.header
                 raw_bbox[tid] = box(h.x_min, h.y_min, h.x_max, h.y_max)
 
-    clip_tasks: list[tuple] = []
-    for tid in present:
-        region = tile_clip_region(cells[tid], margin, buffered_geom)
-        tile = layout.tile(tid)
-        gpd.GeoDataFrame(geometry=[region], crs=cfg["crs"]).to_file(tile.clip_region, driver="GeoJSON")
-        inputs = [tile.raw_laz]
-        if need_neighbours:
+        clip_tasks: list[tuple] = []
+        for tid in present:
+            region = tile_clip_region(cells[tid], margin, buffered_geom)
+            tile = layout.tile(tid)
+            gpd.GeoDataFrame(geometry=[region], crs=cfg["crs"]).to_file(tile.clip_region, driver="GeoJSON")
+            inputs = [tile.raw_laz]
             missing = region.difference(raw_bbox[tid])
             if missing.area > 1e-6:  # the tile's own raw does not cover the whole region
                 inputs += [
                     layout.tile(nbr).raw_laz for nbr in present if nbr != tid and raw_bbox[nbr].intersects(missing)
                 ]
-        clip_tasks.append((tid, output_dir, inputs, args.overwrite))
+            clip_tasks.append((tid, output_dir, inputs, args.overwrite))
 
-    # Sweep 2: clip (with halo) + DTM, per tile.
-    logging.info(f"Clipping + DTM for {len(clip_tasks)} tiles ({n_cores} workers)...")
-    outcomes = run_sweep(clip_and_dtm, clip_tasks, n_cores)
+        # Clip (with halo) + DTM, per tile.
+        logging.info(f"Clipping + DTM for {len(clip_tasks)} tiles ({n_cores} workers)...")
+        outcomes = run_sweep(clip_and_dtm, clip_tasks, n_cores)
 
     n_ok = sum(1 for o in outcomes if o.status == "ok")
-    logging.info(f"Completed get_data for case: {case} — {n_ok}/{len(clip_tasks)} tiles clipped + DTM ok")
+    logging.info(f"Completed get_data for case: {case} — {n_ok}/{len(outcomes)} tiles clipped + DTM ok")
 
     # Exit non-zero on any genuine download or clip/DTM failure (graceful
     # "not_in_coverage" skips excluded), so the orchestrator aborts rather
