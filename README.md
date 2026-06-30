@@ -149,11 +149,34 @@ of millions of points) to clip a small area out of it, get_data now reads only
 each tile's area region directly from the remote file with PDAL. On an Emmen AHN6
 cell a 1.2 %-of-cell region read took about 2.5 s against about 74 s for the whole
 cell, and the read returns the same point set the whole-download-then-clip path
-produced. AHN4 and AHN5 from GeoTiles are plain LAZ with no COPC, so they keep
-the whole-tile download (now cached).
+produced.
+
+**Partial range reads for AHN4/AHN5.** AHN4 and AHN5 from GeoTiles are plain LAZ
+with no COPC, but the host still honours HTTP range requests and each tile ships a
+small `.lax` spatial index. get_data reads that index, turns the area into the
+point-index runs that cover it, and pulls only the chunks those runs touch, with a
+read-ahead window that keeps a run to a few large requests rather than one per
+chunk. How much this saves is set by the file, not the reader. A plain LAZ is not
+spatially ordered the way a COPC is, so a small area's points are scattered across
+a sizeable fraction of the chunks, about a quarter of a tile for a 250 m area and
+about half for a 400 m area. The read is therefore worth it for small areas and
+not for large ones, so get_data estimates the fraction from the index first and
+downloads the whole tile (into the shared cache, reused across areas) when a
+partial read would not pay, and falls back to the whole tile on any index or read
+fault. The exact crop still happens in the clip step, so the points are identical
+to a whole-tile clip.
+
+**Overlapping fetch and clip.** Overlapping GeoTiles tiles carry each tile's halo
+within that tile's own cloud, so a tile's clip needs no neighbour. get_data runs a
+fused acquire, clip, and DTM per tile for such sources, with no barrier between
+fetching and clipping, so one tile's clip and DTM (on the processor) overlap
+another tile's range read (on the network). A hard-partitioned source (AHN6) fills
+its halo from neighbouring cells and so keeps the two-sweep barrier.
 
 Together, on a cache hit the Leiden 250 m get_data stage drops from about 117 s to
-about 14 s with byte-identical clipped output.
+about 14 s with byte-identical clipped output. Forced fully cold, with no cached
+tiles, the partial reads bring it to about 25 s for the 250 m area and about 40 s
+for the 400 m area, against roughly 100 s for a whole-tile download.
 
 ## Performance: scratch cache and parallel reconstruction
 

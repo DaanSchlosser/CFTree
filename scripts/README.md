@@ -73,9 +73,14 @@ Performs download, clipping, and DTM generation.
    `<index>.bounds.npz` sidecar, so later runs resolve tiles in under a second.
 3. Acquire each tile's points. AHN6 Cloud-Optimized Point Clouds are range-read
    over HTTP for the AOI region only (PDAL `readers.copc`). AHN4/AHN5 sub-tiles
-   are downloaded whole from the [TU Delft GeoTiles server](https://geotiles.citg.tudelft.nl/)
-   into a shared cache (see below) and reused across areas.
-4. Clip tiles to AOI (with a neighbour halo) and compute `clipped_dtm.tif`.
+   from the [TU Delft GeoTiles server](https://geotiles.citg.tudelft.nl/) are plain
+   LAZ; they are range-read for the AOI region through their `.lax` index when that
+   pulls materially less than the whole tile, and otherwise downloaded whole into a
+   shared cache (see below) and reused across areas.
+4. Clip tiles to AOI and compute `clipped_dtm.tif`. Overlapping sources (AHN4/AHN5)
+   clip each tile from its own cloud and fuse this step with acquisition per tile;
+   a hard-partitioned source (AHN6) fills each tile's halo from neighbouring cells,
+   so it acquires all tiles before clipping.
 
 ### Caches
 
@@ -84,7 +89,9 @@ Performs download, clipping, and DTM generation.
 - **Shared tiles** for AHN4/AHN5 land in `<data_root>/.ahn_cache/<source>/`
   (override with `CFTREE_AHN_CACHE`). A downloaded tile is part of an immutable
   national dataset, so it is fetched once and hardlinked into each case; the cache
-  is not invalidated by `--overwrite`. AHN6 is range-read per area and not cached.
+  is not invalidated by `--overwrite`. The small `.lax` index used by the partial
+  range reads is cached here too. AHN6 and AHN4/AHN5 partial range reads pull only
+  the AOI region per area and are not cached as whole tiles.
 
 ### Tile sources
 
@@ -100,8 +107,8 @@ footprint each tile logs `not_found_remote`; fall back to AHN4 or AHN5 for those
 ### Outputs:
 per tile:
 ``` bash
-raw.laz                 # raw ALS point cloud tile downloaded
-raw.lax                 # spatial index file (AHN4/AHN5 only; AHN6 COPC has built-in indexing)
+raw.laz                 # raw points: the AOI region (range read) or the whole tile (download)
+raw.lax                 # spatial index, only when a whole AHN4/AHN5 tile is downloaded
 clipped.laz             # point cloud clipped to case polygon
 clipped_dtm.tif         # DTM raster of clipped tile
 ```
