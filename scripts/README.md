@@ -68,12 +68,23 @@ Performs download, clipping, and DTM generation.
 
 ### Main steps:
 1. Buffer the case polygon (`case_area.geojson`).
-2. Resolve the AHN tile catalog (AHN6 by default; opt in to AHN4 or AHN5).
-3. Download raw `.laz` files (AHN6 Cloud-Optimized Point Clouds from
-   [basisdata.nl](https://basisdata.nl/hwh-ahn/AHN6/01_LAZ/), or AHN4/AHN5 sub-tiles
-   from the [TU Delft GeoTiles server](https://geotiles.citg.tudelft.nl/) via
-   `--ahn-version 4` / `--ahn-version 5`).
-4. Clip tiles to AOI and compute `clipped_dtm.tif`.
+2. Resolve the AHN tile catalog (AHN6 by default; opt in to AHN4 or AHN5). For
+   AHN4/AHN5 the national GeoTiles index is read once and cached to a slim
+   `<index>.bounds.npz` sidecar, so later runs resolve tiles in under a second.
+3. Acquire each tile's points. AHN6 Cloud-Optimized Point Clouds are range-read
+   over HTTP for the AOI region only (PDAL `readers.copc`). AHN4/AHN5 sub-tiles
+   are downloaded whole from the [TU Delft GeoTiles server](https://geotiles.citg.tudelft.nl/)
+   into a shared cache (see below) and reused across areas.
+4. Clip tiles to AOI (with a neighbour halo) and compute `clipped_dtm.tif`.
+
+### Caches
+
+- **Tile index** (`resources/AHN_subunits_GeoTiles/AHN_subunits_GeoTiles.bounds.npz`)
+  is rebuilt on demand from the shipped shapefile and git-ignored.
+- **Shared tiles** for AHN4/AHN5 land in `<data_root>/.ahn_cache/<source>/`
+  (override with `CFTREE_AHN_CACHE`). A downloaded tile is part of an immutable
+  national dataset, so it is fetched once and hardlinked into each case; the cache
+  is not invalidated by `--overwrite`. AHN6 is range-read per area and not cached.
 
 ### Tile sources
 

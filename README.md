@@ -115,6 +115,46 @@ for each area of interest.
 The image embeds CGAL alpha-wrap (GPL-3.0) and the TreeSeparation binary, so the
 image is a GPL-3.0 distribution, consistent with this repository's licence.
 
+## Performance: data acquisition (get_data)
+
+For a small area the data acquisition stage, not reconstruction, is the longest
+part of the pipeline. On a Leiden 250 m area it took about 117 s, split roughly
+evenly between resolving which tiles intersect the area (about 53 s) and
+downloading them (about 51 s). The download is bandwidth-bound, so adding
+connections does not help (a single connection already saturates the link); the
+only levers are reading fewer bytes and not reading the same bytes twice. Three
+changes address that.
+
+**Cached tile index.** The shipped GeoTiles sub-tile index is a national
+shapefile of about 76 000 polygons (a roughly 49 MB `.shp` and `.dbf` pair).
+Reading and reprojecting all of it to find a handful of intersecting tiles cost
+30 to 60 s on a virtualized mount, every run. The first run now distils the index
+to a slim `<index>.bounds.npz` sidecar (sub-tile ids and geometries only), keyed
+by the shapefile's size and mtime, and later runs load it in under a second and
+rebuild it automatically if the shapefile changes. Tile selection is identical to
+the full read. This sidecar is git-ignored and also speeds the segmentation
+stage, which resolves the same index.
+
+**Shared tile cache.** A downloaded AHN tile is part of an immutable national
+dataset, so re-downloading it for a second area that overlaps the first is pure
+waste. Raw tiles now land in a cross-area cache (under `<data_root>/.ahn_cache`,
+or `CFTREE_AHN_CACHE` if set) and are hardlinked into each case, so an area that
+reuses a tile pays no network cost. The cache is independent of `--overwrite`,
+which still re-derives the per-area clip and downstream artifacts but never
+re-fetches an immutable tile.
+
+**COPC range reads for AHN6.** AHN6 ships Cloud-Optimized Point Clouds, which a
+reader can range-read over HTTP. Instead of downloading a whole 1 km cell (tens
+of millions of points) to clip a small area out of it, get_data now reads only
+each tile's area region directly from the remote file with PDAL. On an Emmen AHN6
+cell a 1.2 %-of-cell region read took about 2.5 s against about 74 s for the whole
+cell, and the read returns the same point set the whole-download-then-clip path
+produced. AHN4 and AHN5 from GeoTiles are plain LAZ with no COPC, so they keep
+the whole-tile download (now cached).
+
+Together, on a cache hit the Leiden 250 m get_data stage drops from about 117 s to
+about 14 s with byte-identical clipped output.
+
 ## Performance: scratch cache and parallel reconstruction
 
 Two changes dominate reconstruction wall time, and both apply to every run
