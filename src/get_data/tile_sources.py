@@ -30,10 +30,18 @@ from shapely.geometry.base import BaseGeometry
 class TileSource(ABC):
     name: str
     attribution: str
-    # A streaming source serves a Cloud-Optimized Point Cloud (COPC) that PDAL
-    # can range-read over HTTP, so get_data fetches only each tile's AOI region
-    # instead of downloading the whole cell. Whole-file sources leave this False.
+    # A streaming source fetches only each tile's AOI region instead of
+    # downloading the whole cell. Whole-file sources leave this False.
     is_streaming: bool = False
+    # How a streaming source reads a region: "copc" range-reads a Cloud-Optimized
+    # Point Cloud (AHN6), "lax" range-reads a plain LAZ via its .lax index
+    # (AHN4/AHN5), "whole" downloads the whole tile (the default, non-streaming).
+    acquire_mode: str = "whole"
+    # Whether each tile's own cloud already covers its halo band, so the clip
+    # needs no neighbour tiles. True for sources whose tiles overlap by at least
+    # the halo margin (GeoTiles AHN4/AHN5); False for hard-partitioned sources
+    # (AHN6 COPC), whose clip must merge adjacent cells to fill the halo.
+    self_contained_halo: bool = False
 
     @abstractmethod
     def tiles_for_aoi(self, aoi_geom: BaseGeometry) -> list[str]:
@@ -93,8 +101,17 @@ class GeoTilesSource(TileSource):
     load that in well under a second and rebuild it automatically when the
     shapefile changes. The sidecar is a pure derivation of the shipped
     shapefile, so it is safe to delete and is git-ignored.
+
+    The plain LAZ tiles ship a `.lax` spatial index and the host honours HTTP
+    range requests, so a small AOI is range-read from the remote LAZ via that
+    index (``acquire_mode = "lax"``, see ``lax_partial.py``) rather than
+    downloaded whole. The tiles overlap their neighbours, so each tile's own
+    cloud already covers its halo and the clip needs no neighbour tiles.
     """
 
+    is_streaming = True
+    acquire_mode = "lax"
+    self_contained_halo = True
     _CACHE_SUFFIX = ".bounds.npz"
 
     def __init__(self, version: int, index_shp: Path):
@@ -215,6 +232,7 @@ class AHN6KMSource(TileSource):
     # AHN6 ships COPC, so get_data range-reads each tile's AOI region from the
     # remote file instead of downloading the whole 1 km cell.
     is_streaming = True
+    acquire_mode = "copc"
 
     # Grid parameters extracted from the AHN bladwijzer's sheets-DoENGwi0.bin:
     # tile lower-left = (GRID_ORIGIN_X + col*TILE_SIZE, GRID_ORIGIN_Y + row*TILE_SIZE).

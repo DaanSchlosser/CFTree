@@ -28,6 +28,7 @@ from src.config import get_config, setup_logger
 from src.get_data.clip_tile import clip_tile
 from src.get_data.download_geotiles import download_tile
 from src.get_data.extract_dtm import compute_tile_dtm
+from src.get_data.lax_partial import read_region
 from src.get_data.stream_copc import stream_tile_region
 from src.get_data.tile_sources import TileSource, from_version
 from src.stages import (
@@ -73,20 +74,25 @@ def stream_one(
     region: Polygon,
     overwrite: bool,
 ) -> TileOutcome:
-    """Sweep 1 (streaming sources): range-read one tile's AOI region from its COPC.
+    """Sweep 1 (streaming sources): range-read one tile's AOI region from the remote file.
 
-    The COPC-native counterpart to `download_one`: instead of downloading a whole
-    cell it reads only `region` (the tile's clip region) over HTTP range requests.
-    The resulting `raw.laz` plugs into the same clip sweep, which still merges
-    neighbour regions to fill the halo, so the rest of the pipeline is unchanged.
+    Instead of downloading a whole cell, reads only `region` (the tile's clip
+    region) over HTTP range requests, dispatching on the source's `acquire_mode`:
+    "copc" reads a Cloud-Optimized Point Cloud (AHN6), "lax" reads a plain LAZ
+    through its `.lax` index (AHN4/AHN5, falling back to a whole-tile download when
+    a partial read would not pay). The resulting `raw.laz` plugs into the same
+    clip sweep, so the rest of the pipeline is unchanged.
     """
     try:
-        dl = stream_tile_region(tile_id, output_dir, source, region, overwrite=overwrite)
+        if source.acquire_mode == "lax":
+            dl = read_region(tile_id, output_dir, source, region, overwrite=overwrite)
+        else:
+            dl = stream_tile_region(tile_id, output_dir, source, region, overwrite=overwrite)
     except RemoteUnavailableError as e:
         logging.info(f"[{tile_id}] Skipped: {e}")
         return TileOutcome(tile_id=tile_id, status="not_in_coverage", detail=str(e))
     except StageError as e:
-        logging.warning(f"[{tile_id}] COPC region read failed: {e}")
+        logging.warning(f"[{tile_id}] Region read failed: {e}")
         return TileOutcome(tile_id=tile_id, status="download_failed", detail=str(e))
     return TileOutcome(tile_id=tile_id, status="downloaded", paths={"raw": dl.laz})
 
@@ -274,7 +280,7 @@ def main() -> int:
     # AOI region from the remote file; a whole-file source (GeoTiles) downloads
     # the cell into the shared tile cache.
     if source.is_streaming:
-        logging.info(f"Range-reading {len(tile_ids)} tile region(s) from COPC ({n_cores} workers)...")
+        logging.info(f"Range-reading {len(tile_ids)} tile region(s) ({n_cores} workers)...")
         read_cells = {tid: source.core_cell(tid) for tid in tile_ids}
         stream_tasks = [
             (tid, output_dir, source, tile_clip_region(read_cells[tid], margin, buffered_geom), args.overwrite)
@@ -303,21 +309,23 @@ def main() -> int:
     # Build each tile's clip region (its core cell + halo margin, intersected with
     # the buffered AOI) and the neighbour raw clouds needed to fill it.
     cells = {tid: source.core_cell(tid) for tid in present}
-    # Actual extent of each tile's own raw cloud (from the LAZ header). This is what
-    # makes the halo gather uniform across AHN versions WITHOUT a per-version branch
-    # and without duplicating points: we only pull a neighbour for the part of the
-    # region the tile's OWN raw does not already cover. Hard-partitioned AHN6 raws
-    # stop at the cell edge, so the margin band is "missing" and the (disjoint)
-    # neighbour cells are pulled to fill it; already-overlapping AHN4/5 raws cover
-    # the whole region, so nothing is missing and the clip degenerates to a single
-    # input. (This stays duplicate-point-free as long as the halo margin does not
-    # exceed an overlapping source's inter-tile overlap — true for AHN4/5's ~20 m
-    # vs the 12 m default; AHN6 has zero overlap so any margin is safe.)
+    # A hard-partitioned source (AHN6 COPC) stops each raw at the cell edge, so a
+    # tile's halo band is filled from the (disjoint) neighbour cells: pull a
+    # neighbour for the part of the region the tile's OWN raw does not cover, read
+    # from each raw's actual extent (the LAZ header bbox). An overlapping,
+    # self-contained source (GeoTiles AHN4/AHN5) already carries its halo within a
+    # single tile's own cloud (the margin stays within the inter-tile overlap), so
+    # it clips one input. Merging overlapping neighbours there would DUPLICATE the
+    # shared boundary points, so it must stay single-input regardless of the raw's
+    # exact bbox (a partial range read trims the raw to ~the region, which would
+    # otherwise trip a bbox-based "missing" test on edge slivers).
+    need_neighbours = not source.self_contained_halo
     raw_bbox: dict[str, Polygon] = {}
-    for tid in present:
-        with laspy.open(layout.tile(tid).raw_laz) as f:
-            h = f.header
-            raw_bbox[tid] = box(h.x_min, h.y_min, h.x_max, h.y_max)
+    if need_neighbours:
+        for tid in present:
+            with laspy.open(layout.tile(tid).raw_laz) as f:
+                h = f.header
+                raw_bbox[tid] = box(h.x_min, h.y_min, h.x_max, h.y_max)
 
     clip_tasks: list[tuple] = []
     for tid in present:
@@ -325,9 +333,12 @@ def main() -> int:
         tile = layout.tile(tid)
         gpd.GeoDataFrame(geometry=[region], crs=cfg["crs"]).to_file(tile.clip_region, driver="GeoJSON")
         inputs = [tile.raw_laz]
-        missing = region.difference(raw_bbox[tid])
-        if missing.area > 1e-6:  # the tile's own raw does not cover the whole region
-            inputs += [layout.tile(nbr).raw_laz for nbr in present if nbr != tid and raw_bbox[nbr].intersects(missing)]
+        if need_neighbours:
+            missing = region.difference(raw_bbox[tid])
+            if missing.area > 1e-6:  # the tile's own raw does not cover the whole region
+                inputs += [
+                    layout.tile(nbr).raw_laz for nbr in present if nbr != tid and raw_bbox[nbr].intersects(missing)
+                ]
         clip_tasks.append((tid, output_dir, inputs, args.overwrite))
 
     # Sweep 2: clip (with halo) + DTM, per tile.
