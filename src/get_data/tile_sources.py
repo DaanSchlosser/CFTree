@@ -22,6 +22,7 @@ from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
+import shapely
 import shapely.geometry as sg
 from shapely.geometry.base import BaseGeometry
 
@@ -71,7 +72,22 @@ class TileSource(ABC):
 
 
 class GeoTilesSource(TileSource):
-    """AHN4 / AHN5 sub-tiles served by the TU Delft GeoTiles host."""
+    """AHN4 / AHN5 sub-tiles served by the TU Delft GeoTiles host.
+
+    The shipped sub-tile index is a national shapefile of ~76k polygons (a
+    ~49 MB ``.shp`` / ``.dbf`` pair). Reading and reprojecting all of it with
+    GeoPandas on every run cost ~30-60 s on a virtualised mount and dominated
+    ``get_data`` for a small AOI. The geometry is the only thing any caller
+    needs (``tiles_for_aoi`` intersects it; ``core_cell`` / ``owns_centroids``
+    read its bounds), so the first run distils the index to a slim
+    ``<index>.bounds.npz`` sidecar holding just the sub-tile ids and their
+    geometries (as WKB), keyed by the shapefile's size and mtime. Later runs
+    load that in well under a second and rebuild it automatically when the
+    shapefile changes. The sidecar is a pure derivation of the shipped
+    shapefile, so it is safe to delete and is git-ignored.
+    """
+
+    _CACHE_SUFFIX = ".bounds.npz"
 
     def __init__(self, version: int, index_shp: Path):
         self._version = version
@@ -79,41 +95,100 @@ class GeoTilesSource(TileSource):
         self.name = f"AHN{version}"
         self.attribution = f"AHN{version} (c) Rijkswaterstaat / Waterschappen, CC0 1.0"
         self._base_url = f"https://geotiles.citg.tudelft.nl/AHN{version}_T"
-        self._index_gdf: gpd.GeoDataFrame | None = None
-        self._cell_by_id: dict[str, BaseGeometry] | None = None
+        self._ids: list[str] | None = None
+        self._geoms: np.ndarray | None = None  # parallel array of shapely polygons (EPSG:28992)
+        self._row_by_id: dict[str, int] | None = None
+        self._tree: shapely.STRtree | None = None
 
-    def _load_index(self) -> gpd.GeoDataFrame:
-        """Lazily load and cache the GeoTiles sub-tile index (EPSG:28992).
+    def _cache_path(self) -> Path:
+        return self._index_shp.with_name(self._index_shp.stem + self._CACHE_SUFFIX)
 
-        Cached on the instance because `core_cell` is queried per tile and the
-        index has tens of thousands of rows; re-reading the shapefile per call
-        would dominate runtime.
+    def _index_stamp(self) -> tuple[int, int]:
+        st = self._index_shp.stat()
+        return int(st.st_size), int(st.st_mtime)
+
+    def _load_index(self) -> None:
+        """Populate ``_ids`` / ``_geoms`` from the slim cache, building it once.
+
+        Cached on the instance because ``core_cell`` is queried per tile and the
+        index has tens of thousands of rows; re-reading per call would dominate
+        runtime.
         """
-        if self._index_gdf is None:
-            if not self._index_shp.exists():
-                raise FileNotFoundError(
-                    f"AHN sub-tile index not found: {self._index_shp}. "
-                    "Expected the shipped resource at resources/AHN_subunits_GeoTiles/."
-                )
-            self._index_gdf = gpd.read_file(self._index_shp).to_crs("EPSG:28992")
-        return self._index_gdf
+        if self._ids is not None:
+            return
+        if not self._index_shp.exists():
+            raise FileNotFoundError(
+                f"AHN sub-tile index not found: {self._index_shp}. "
+                "Expected the shipped resource at resources/AHN_subunits_GeoTiles/."
+            )
+        stamp = self._index_stamp()
+        cached = self._read_cache(stamp)
+        ids, geoms = cached if cached is not None else self._build_cache(stamp)
+        self._ids = ids
+        self._geoms = geoms
+        self._row_by_id = {tid: i for i, tid in enumerate(ids)}
+
+    def _read_cache(self, stamp: tuple[int, int]) -> tuple[list[str], np.ndarray] | None:
+        """Read the slim sidecar if present and current; else ``None`` to rebuild."""
+        cache = self._cache_path()
+        if not cache.exists():
+            return None
+        try:
+            with np.load(cache, allow_pickle=False) as data:
+                if tuple(int(v) for v in data["stamp"]) != stamp:
+                    return None
+                ids = [str(t) for t in data["ids"].tolist()]
+                wkb = data["wkb"]
+                off = data["wkb_off"]
+            geoms = shapely.from_wkb([wkb[off[i] : off[i + 1]].tobytes() for i in range(len(ids))])
+            return ids, np.asarray(geoms, dtype=object)
+        except Exception as exc:  # noqa: BLE001 - any cache problem falls back to a rebuild
+            logging.debug("Ignoring unreadable index cache %s (%s); rebuilding", cache, exc)
+            return None
+
+    def _build_cache(self, stamp: tuple[int, int]) -> tuple[list[str], np.ndarray]:
+        """Read the full shapefile once, distil it to the slim sidecar, and return it."""
+        logging.info(
+            "Building one-time AHN sub-tile index cache from %s (later runs reuse it)",
+            self._index_shp.name,
+        )
+        gdf = gpd.read_file(self._index_shp, columns=["GT_AHNSUB"]).to_crs("EPSG:28992")
+        ids = [str(t) for t in gdf["GT_AHNSUB"].tolist()]
+        geoms = np.asarray(gdf.geometry.values, dtype=object)
+        try:
+            wkb_list = shapely.to_wkb(geoms)
+            off = np.zeros(len(wkb_list) + 1, dtype=np.int64)
+            for i, b in enumerate(wkb_list):
+                off[i + 1] = off[i] + len(b)
+            np.savez(
+                self._cache_path(),
+                stamp=np.asarray(stamp, dtype=np.int64),
+                ids=np.asarray(ids, dtype="U16"),
+                wkb=np.frombuffer(b"".join(wkb_list), dtype=np.uint8),
+                wkb_off=off,
+            )
+        except OSError as exc:
+            logging.debug("Could not persist AHN index cache (%s); continuing without it", exc)
+        return ids, geoms
+
+    def _strtree(self) -> shapely.STRtree:
+        self._load_index()
+        if self._tree is None:
+            self._tree = shapely.STRtree(self._geoms)
+        return self._tree
 
     def tiles_for_aoi(self, aoi_geom: BaseGeometry) -> list[str]:
-        gdf = self._load_index()
-        sel = gdf[gdf.intersects(aoi_geom)]
-        return [str(tid) for tid in sel["GT_AHNSUB"].tolist()]
+        self._load_index()
+        rows = self._strtree().query(aoi_geom, predicate="intersects")
+        return [self._ids[r] for r in sorted(rows.tolist())]
 
     def core_cell(self, tile_id: str) -> BaseGeometry:
         # Nominal sub-tile polygon from the GeoTiles index. The downloaded LAZ
         # tiles overlap, but the index subunits partition the plane; ownership
         # uses the polygon's axis-aligned bounds (see TileSource.owns_centroids).
-        if self._cell_by_id is None:
-            gdf = self._load_index()
-            self._cell_by_id = {
-                str(tid): geom for tid, geom in zip(gdf["GT_AHNSUB"].tolist(), gdf.geometry.tolist(), strict=True)
-            }
+        self._load_index()
         try:
-            return self._cell_by_id[str(tile_id)]
+            return self._geoms[self._row_by_id[str(tile_id)]]
         except KeyError as e:
             raise KeyError(f"Unknown {self.name} sub-tile id: {tile_id}") from e
 

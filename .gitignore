@@ -50,6 +50,9 @@ nohup.out
 # ----------------------------
 .tmp_*
 
+# Derived AHN sub-tile index cache (rebuilt on demand from the shipped shapefile)
+resources/**/*.bounds.npz
+
 # ----------------------------
 # LOCAL CONFIG
 # ----------------------------
