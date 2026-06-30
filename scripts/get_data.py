@@ -28,6 +28,7 @@ from src.config import get_config, setup_logger
 from src.get_data.clip_tile import clip_tile
 from src.get_data.download_geotiles import download_tile
 from src.get_data.extract_dtm import compute_tile_dtm
+from src.get_data.stream_copc import stream_tile_region
 from src.get_data.tile_sources import TileSource, from_version
 from src.stages import (
     MissingPrerequisiteError,
@@ -63,6 +64,46 @@ def download_one(
         logging.warning(f"[{tile_id}] Download failed: {e}")
         return TileOutcome(tile_id=tile_id, status="download_failed", detail=str(e))
     return TileOutcome(tile_id=tile_id, status="downloaded", paths={"raw": dl.laz})
+
+
+def stream_one(
+    tile_id: str,
+    output_dir: Path,
+    source: TileSource,
+    region: Polygon,
+    overwrite: bool,
+) -> TileOutcome:
+    """Sweep 1 (streaming sources): range-read one tile's AOI region from its COPC.
+
+    The COPC-native counterpart to `download_one`: instead of downloading a whole
+    cell it reads only `region` (the tile's clip region) over HTTP range requests.
+    The resulting `raw.laz` plugs into the same clip sweep, which still merges
+    neighbour regions to fill the halo, so the rest of the pipeline is unchanged.
+    """
+    try:
+        dl = stream_tile_region(tile_id, output_dir, source, region, overwrite=overwrite)
+    except RemoteUnavailableError as e:
+        logging.info(f"[{tile_id}] Skipped: {e}")
+        return TileOutcome(tile_id=tile_id, status="not_in_coverage", detail=str(e))
+    except StageError as e:
+        logging.warning(f"[{tile_id}] COPC region read failed: {e}")
+        return TileOutcome(tile_id=tile_id, status="download_failed", detail=str(e))
+    return TileOutcome(tile_id=tile_id, status="downloaded", paths={"raw": dl.laz})
+
+
+def tile_clip_region(cell: Polygon, margin: float, buffered_geom: Polygon) -> Polygon:
+    """A tile's clip region: its core cell grown by the halo margin, clipped to the AOI.
+
+    The single definition shared by the streaming sweep (which range-reads this
+    region) and the clip sweep (which crops to it), so the points a tile is read
+    with and clipped to can never drift apart. Falls back to the unclipped grown
+    cell if the intersection is empty (a tile the buffered AOI only touches at an
+    edge), matching the clip sweep's own guard.
+    """
+    minx, miny, maxx, maxy = cell.bounds
+    grown = box(minx - margin, miny - margin, maxx + margin, maxy + margin)
+    region = grown.intersection(buffered_geom)
+    return region if not region.is_empty else grown
 
 
 def clip_and_dtm(
@@ -214,7 +255,7 @@ def main() -> int:
         return 0
 
     # ------------------------------------------------------------------
-    # Step 3: download all tiles (barrier), then clip + DTM with a halo
+    # Step 3: acquire all tiles (barrier), then clip + DTM with a halo
     # ------------------------------------------------------------------
     margin = args.halo_margin
     if args.buffer < margin:
@@ -224,13 +265,27 @@ def main() -> int:
             "Increase --buffer to at least the halo margin."
         )
 
-    # Sweep 1: download every tile. Must finish before any clip starts, because a
-    # tile's clip now reads its neighbours' raw clouds (the halo) — otherwise which
-    # border points a clip sees would depend on download order (non-deterministic).
-    logging.info(f"Downloading {len(tile_ids)} tiles ({n_cores} workers)...")
-    download_outcomes = run_sweep(
-        download_one, [(tid, output_dir, source, args.overwrite) for tid in tile_ids], n_cores
-    )
+    buffered_geom = aoi.union_all()
+
+    # Sweep 1: acquire every tile's points. Must finish before any clip starts,
+    # because a tile's clip reads its neighbours' clouds (the halo) — otherwise
+    # which border points a clip sees would depend on acquisition order
+    # (non-deterministic). A streaming (COPC) source range-reads only each tile's
+    # AOI region from the remote file; a whole-file source (GeoTiles) downloads
+    # the cell into the shared tile cache.
+    if source.is_streaming:
+        logging.info(f"Range-reading {len(tile_ids)} tile region(s) from COPC ({n_cores} workers)...")
+        read_cells = {tid: source.core_cell(tid) for tid in tile_ids}
+        stream_tasks = [
+            (tid, output_dir, source, tile_clip_region(read_cells[tid], margin, buffered_geom), args.overwrite)
+            for tid in tile_ids
+        ]
+        download_outcomes = run_sweep(stream_one, stream_tasks, n_cores)
+    else:
+        logging.info(f"Downloading {len(tile_ids)} tiles ({n_cores} workers)...")
+        download_outcomes = run_sweep(
+            download_one, [(tid, output_dir, source, args.overwrite) for tid in tile_ids], n_cores
+        )
     download_failed = failed_statuses(o.status for o in download_outcomes)
 
     present = [tid for tid in tile_ids if layout.tile(tid).raw_laz.exists()]
@@ -247,7 +302,6 @@ def main() -> int:
 
     # Build each tile's clip region (its core cell + halo margin, intersected with
     # the buffered AOI) and the neighbour raw clouds needed to fill it.
-    buffered_geom = aoi.union_all()
     cells = {tid: source.core_cell(tid) for tid in present}
     # Actual extent of each tile's own raw cloud (from the LAZ header). This is what
     # makes the halo gather uniform across AHN versions WITHOUT a per-version branch
@@ -267,10 +321,7 @@ def main() -> int:
 
     clip_tasks: list[tuple] = []
     for tid in present:
-        minx, miny, maxx, maxy = cells[tid].bounds
-        region = box(minx - margin, miny - margin, maxx + margin, maxy + margin).intersection(buffered_geom)
-        if region.is_empty:
-            region = box(minx - margin, miny - margin, maxx + margin, maxy + margin)
+        region = tile_clip_region(cells[tid], margin, buffered_geom)
         tile = layout.tile(tid)
         gpd.GeoDataFrame(geometry=[region], crs=cfg["crs"]).to_file(tile.clip_region, driver="GeoJSON")
         inputs = [tile.raw_laz]

@@ -30,6 +30,10 @@ from shapely.geometry.base import BaseGeometry
 class TileSource(ABC):
     name: str
     attribution: str
+    # A streaming source serves a Cloud-Optimized Point Cloud (COPC) that PDAL
+    # can range-read over HTTP, so get_data fetches only each tile's AOI region
+    # instead of downloading the whole cell. Whole-file sources leave this False.
+    is_streaming: bool = False
 
     @abstractmethod
     def tiles_for_aoi(self, aoi_geom: BaseGeometry) -> list[str]:
@@ -38,6 +42,10 @@ class TileSource(ABC):
     @abstractmethod
     def laz_url(self, tile_id: str) -> str:
         """Canonical LAZ URL for `tile_id`."""
+
+    def streaming_url(self, tile_id: str) -> str | None:
+        """Range-readable COPC URL for `tile_id`, or `None` for a whole-file source."""
+        return None
 
     @abstractmethod
     def core_cell(self, tile_id: str) -> BaseGeometry:
@@ -204,6 +212,9 @@ class AHN6KMSource(TileSource):
 
     name = "AHN6"
     attribution = "AHN6 (c) Rijkswaterstaat / Waterschappen, CC BY 4.0"
+    # AHN6 ships COPC, so get_data range-reads each tile's AOI region from the
+    # remote file instead of downloading the whole 1 km cell.
+    is_streaming = True
 
     # Grid parameters extracted from the AHN bladwijzer's sheets-DoENGwi0.bin:
     # tile lower-left = (GRID_ORIGIN_X + col*TILE_SIZE, GRID_ORIGIN_Y + row*TILE_SIZE).
@@ -228,6 +239,10 @@ class AHN6KMSource(TileSource):
 
     def laz_url(self, tile_id: str) -> str:
         return f"{self._BASE_URL}/AHN6_2025_C_{tile_id}.COPC.LAZ"
+
+    def streaming_url(self, tile_id: str) -> str | None:
+        # The AHN6 LAZ *is* a COPC, so the canonical URL is the streamable one.
+        return self.laz_url(tile_id)
 
     def core_cell(self, tile_id: str) -> BaseGeometry:
         # tile_id "x_y" is the SW corner of the 1x1 km cell; reuses the same box
