@@ -115,6 +115,23 @@ for each area of interest.
 The image embeds CGAL alpha-wrap (GPL-3.0) and the TreeSeparation binary, so the
 image is a GPL-3.0 distribution, consistent with this repository's licence.
 
+### Verifying the image
+
+A smoke test ships with the image and confirms the build is healthy without a
+network download or a sample dataset. It checks that the baked environment
+imports the geospatial stack and that both compiled binaries run on tiny
+synthetic point clouds, which catches a binary that compiled but cannot load its
+shared libraries at runtime:
+
+```bash
+docker run --rm cftree:local python /opt/cftree/docker/smoke_test.py
+```
+
+A GitHub Actions workflow (`.github/workflows/docker-smoke.yml`) builds the image
+and runs this same smoke test on every change to the Dockerfile, the environment,
+or the source, so a broken build is caught in CI rather than on a colleague's
+first run.
+
 ## Performance: data acquisition (get_data)
 
 For a small area the data acquisition stage, not reconstruction, is the longest
