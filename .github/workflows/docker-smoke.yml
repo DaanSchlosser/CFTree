@@ -1,0 +1,71 @@
+name: Docker image smoke test
+
+# Build the CFTree image and run the in-image smoke test, so a colleague's
+# `docker build -t cftree:local .` followed by a `docker run` is known to work
+# rather than build-it-and-hope. The build alone exercises the slow parts that
+# only break in a container (the conda env solve and the two C++ compiles,
+# including the GCC/CGAL patch); the smoke test then runs both compiled binaries
+# on synthetic point clouds, with no network download and no large fixture.
+
+on:
+  push:
+    branches: [main, performance-improvements]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - environment.yml
+      - docker/**
+      - src/**
+      - scripts/**
+      - main.py
+      - .github/workflows/docker-smoke.yml
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - environment.yml
+      - docker/**
+      - src/**
+      - scripts/**
+      - main.py
+      - .github/workflows/docker-smoke.yml
+  workflow_dispatch:
+
+# A newer push to the same ref cancels an in-progress build, since the image
+# build is long and only the latest commit's result matters.
+concurrency:
+  group: docker-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Free up runner disk space
+        # The conda env plus the CGAL build and image layers are several GB; the
+        # preinstalled language SDKs on the runner are not needed and would
+        # otherwise risk a no-space-left failure mid-build.
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup || true
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: cftree:ci
+          # Cache the expensive environment layer across runs so a source-only
+          # change does not re-solve the conda environment.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run the in-image smoke test
+        run: docker run --rm cftree:ci python /opt/cftree/docker/smoke_test.py
