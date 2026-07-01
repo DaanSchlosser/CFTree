@@ -239,9 +239,9 @@ def main() -> int:
     parser.add_argument(
         "--ahn-version",
         type=int,
-        choices=(4, 5, 6),
+        choices=(2, 3, 4, 5, 6),
         default=6,
-        help="AHN release to download (default: 6). 4/5 are TU Delft GeoTiles; 6 is basisdata.nl COPC.",
+        help="AHN release to download (default: 6). 2/3/4/5 are TU Delft GeoTiles; 6 is basisdata.nl COPC.",
     )
     args = parser.parse_args()
 

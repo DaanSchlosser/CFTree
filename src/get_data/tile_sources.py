@@ -6,7 +6,7 @@
 
 """AHN tile-source registry.
 
-AHN4 and AHN5 share the TU Delft GeoTiles host and the shipped
+AHN2 through AHN5 share the TU Delft GeoTiles host and the shipped
 `AHN_subunits_GeoTiles.shp` index, only the URL prefix differs.
 AHN6 is a separate first-release product on basisdata.nl with a derived
 1x1 km grid with Cloud-Optimized Point Clouds.
@@ -88,7 +88,7 @@ class TileSource(ABC):
 
 
 class GeoTilesSource(TileSource):
-    """AHN4 / AHN5 sub-tiles served by the TU Delft GeoTiles host.
+    """AHN2 to AHN5 sub-tiles served by the TU Delft GeoTiles host.
 
     The shipped sub-tile index is a national shapefile of ~76k polygons (a
     ~49 MB ``.shp`` / ``.dbf`` pair). Reading and reprojecting all of it with
@@ -275,8 +275,8 @@ class AHN6KMSource(TileSource):
 
 
 def from_version(version: int, resources_dir: Path) -> TileSource:
-    """Return the `TileSource` for an AHN release version (4, 5, or 6)."""
-    if version in (4, 5):
+    """Return the `TileSource` for an AHN release version (2, 3, 4, 5, or 6)."""
+    if version in (2, 3, 4, 5):
         return GeoTilesSource(
             version=version,
             index_shp=resources_dir / "AHN_subunits_GeoTiles" / "AHN_subunits_GeoTiles.shp",
@@ -288,4 +288,4 @@ def from_version(version: int, resources_dir: Path) -> TileSource:
             "use --ahn-version 4 or 5 to fall back."
         )
         return AHN6KMSource()
-    raise ValueError(f"Unsupported AHN version: {version}. Supported: 4, 5, 6.")
+    raise ValueError(f"Unsupported AHN version: {version}. Supported: 2, 3, 4, 5, 6.")
