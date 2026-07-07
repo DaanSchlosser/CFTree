@@ -83,17 +83,24 @@ conda activate cftree
 
 ## Run with Docker
 
-The Docker image bakes the conda environment and the two compiled C++ binaries,
-so a colleague runs CFTree without a manual WSL setup, a conda environment, or a
-C++ toolchain. The only prerequisites are Docker and a clone of this repository.
+The Docker image bakes the conda environment, the pipeline source, and the two
+compiled C++ binaries, so a colleague runs CFTree without a manual WSL setup, a
+conda environment, or a C++ toolchain. The only prerequisite is Docker.
 
-Build the image once:
+Pull the prebuilt image, published by CI from every verified push to `main`:
+
+```bash
+docker pull ghcr.io/daanschlosser/cftree:latest
+```
+
+Besides `:latest` each push is tagged `v<version>` and `sha-<commit>` for exact
+reproduction. Building locally instead works with a clone of this repository:
 
 ```bash
 docker build -t cftree:local .
 ```
 
-Then run a case by bind-mounting your checkout at `/work`, which keeps `cases/`
+Run a case by bind-mounting your checkout at `/work`, which keeps `cases/`
 and `data/` on the host so the outputs land next to the source as usual:
 
 ```bash
@@ -107,10 +114,12 @@ resolves them even though a clone carries no `build/` outputs. On Windows and
 macOS the build context excludes `data/`, so a large local `data/` directory does
 not slow the build.
 
-The CityGML/Energy ADE creator drives this image directly through its docker
-runner. Set `CFTREE_RUNNER=docker` and `CFTREE_IMAGE=cftree:local` in that
-project's `.env`; the creator then bind-mounts the checkout and runs the image
-for each area of interest.
+The image also carries the full pipeline source at `/opt/cftree`, so it runs
+without any checkout at all: bind-mount only a `cases/` and a `data/` directory
+over the baked tree and set the working directory to `/opt/cftree`. The
+CityGML/Energy ADE creator drives the image this way through its docker runner;
+set `CFTREE_RUNNER=docker` and `CFTREE_IMAGE=ghcr.io/daanschlosser/cftree:latest`
+in that project's `.env` and no CFTree clone is needed.
 
 The image embeds CGAL alpha-wrap (GPL-3.0) and the TreeSeparation binary, so the
 image is a GPL-3.0 distribution, consistent with this repository's licence.
@@ -127,10 +136,11 @@ shared libraries at runtime:
 docker run --rm cftree:local python /opt/cftree/docker/smoke_test.py
 ```
 
-A GitHub Actions workflow (`.github/workflows/docker-smoke.yml`) builds the image
-and runs this same smoke test on every change to the Dockerfile, the environment,
-or the source, so a broken build is caught in CI rather than on a colleague's
-first run.
+A GitHub Actions workflow (`.github/workflows/docker-smoke.yml`) builds the
+image, runs this same smoke test plus the pytest suite inside the image on every
+change to the Dockerfile, the environment, or the source, and publishes the
+verified image to `ghcr.io/daanschlosser/cftree` on pushes to `main`, so a broken
+build is caught in CI rather than on a colleague's first run.
 
 ## Performance: data acquisition (get_data)
 
