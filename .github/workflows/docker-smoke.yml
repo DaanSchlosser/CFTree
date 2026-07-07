@@ -83,8 +83,9 @@ jobs:
       - name: Run the pytest suite in the image
         # The tests are network-free and the image bakes both the source and the
         # conda env, so running them in-image also pins the exact dependency set
-        # a consumer of the published image gets.
-        run: docker run --rm cftree:ci python -m pytest /opt/cftree/tests -q
+        # a consumer of the published image gets. The working directory must be
+        # the baked repository root so the tests can import the src package.
+        run: docker run --rm -w /opt/cftree cftree:ci python -m pytest tests -q
 
       - name: Log in to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
