@@ -1,22 +1,26 @@
-name: Docker image smoke test
+name: Docker image
 
-# Build the CFTree image and run the in-image smoke test, so a colleague's
-# `docker build -t cftree:local .` followed by a `docker run` is known to work
-# rather than build-it-and-hope. The build alone exercises the slow parts that
-# only break in a container (the conda env solve and the two C++ compiles,
-# including the GCC/CGAL patch); the smoke test then runs both compiled binaries
-# on synthetic point clouds, with no network download and no large fixture.
+# Build the CFTree image, prove it works, and publish it. The build alone
+# exercises the slow parts that only break in a container (the conda env solve
+# and the two C++ compiles, including the GCC/CGAL patch); the smoke test then
+# runs both compiled binaries on synthetic point clouds, with no network
+# download and no large fixture; the pytest suite runs inside the image against
+# the baked source. Pushes to main that pass all checks are published to GHCR
+# as ghcr.io/<owner>/cftree with :latest, :v<version>, and :sha-<commit> tags,
+# so consumers can pull a prebuilt image instead of building locally.
 
 on:
   push:
-    branches: [main, performance-improvements]
+    branches: [main]
     paths:
       - Dockerfile
       - .dockerignore
       - environment.yml
+      - pyproject.toml
       - docker/**
       - src/**
       - scripts/**
+      - tests/**
       - main.py
       - .github/workflows/docker-smoke.yml
   pull_request:
@@ -24,9 +28,11 @@ on:
       - Dockerfile
       - .dockerignore
       - environment.yml
+      - pyproject.toml
       - docker/**
       - src/**
       - scripts/**
+      - tests/**
       - main.py
       - .github/workflows/docker-smoke.yml
   workflow_dispatch:
@@ -36,6 +42,10 @@ on:
 concurrency:
   group: docker-smoke-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   smoke:
@@ -69,3 +79,31 @@ jobs:
 
       - name: Run the in-image smoke test
         run: docker run --rm cftree:ci python /opt/cftree/docker/smoke_test.py
+
+      - name: Run the pytest suite in the image
+        # The tests are network-free and the image bakes both the source and the
+        # conda env, so running them in-image also pins the exact dependency set
+        # a consumer of the published image gets.
+        run: docker run --rm cftree:ci python -m pytest /opt/cftree/tests -q
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the verified image to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        # Tag scheme: :latest tracks main, :v<version> tracks the pyproject
+        # version, :sha-<commit> is immutable for exact reproduction. GHCR
+        # requires a lowercase repository owner.
+        run: |
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
+          image="ghcr.io/${owner}/cftree"
+          for tag in latest "v${version}" "sha-${GITHUB_SHA::7}"; do
+            docker tag cftree:ci "${image}:${tag}"
+            docker push "${image}:${tag}"
+          done

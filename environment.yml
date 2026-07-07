@@ -39,10 +39,11 @@ dependencies:
   - requests
   - psutil
 
-  # --- Dev / linting ---
+  # --- Dev / linting / tests ---
   - ruff
   - mypy
   - pyright
+  - pytest
 
   # --- C++ build toolchain (for AlphaWrap and TreeSeparation) ---
   - cmake
