@@ -1,0 +1,64 @@
+# Runtime environment for the Docker image: the packages the pipeline
+# imports or invokes, and nothing else. environment.yml remains the
+# development environment (WSL / native runners, linters, pytest); this file
+# exists so the image does not ship compilers, type checkers, or plotting
+# stacks the pipeline never touches. Keep the two files in step when a new
+# runtime dependency is added.
+#
+# Why each entry is here (audited against main.py, scripts/, src/):
+#   numpy/scipy/pandas   - point-cloud maths and table handling throughout
+#   geopandas-base       - vector IO and CRS handling; -base avoids the
+#                          mapclassify/matplotlib/folium extras of the
+#                          `geopandas` metapackage
+#   shapely/pyproj       - geometry and CRS, also geopandas dependencies
+#   pyogrio              - the geopandas>=1.0 IO engine; pulls libgdal-core,
+#                          which also provides the ogrinfo CLI used by
+#                          src/get_data/tiles_clipper_robust.sh
+#   rasterio             - DTM sampling in the reconstruction stage
+#   laspy + lazrs-python - LAZ read/write; lazrs is laspy's compression
+#                          backend and is pinned explicitly so an upstream
+#                          packaging change cannot drop it silently
+#   python-pdal          - pdal.Pipeline for DTM extraction and AHN6 COPC
+#                          streaming; pulls libpdal-core, which provides the
+#                          pdal CLI used by tiles_clipper_robust.sh. The
+#                          `pdal` metapackage is deliberately absent: it only
+#                          adds plugin drivers (arrow, tiledb, e57, draco)
+#                          the pipeline never uses
+#   trimesh + embreex    - crown meshes; embreex provides the embree
+#                          ray-mesh acceleration trimesh 4.x uses for
+#                          mesh.contains(), without which the porosity
+#                          metric falls back to pure-Python ray casting and
+#                          can exhaust memory on moderate inputs
+#   requests             - AHN tile downloads and HTTP range reads
+#   gmp/mpfr/libstdcxx   - shared libraries the compiled awrap_points and
+#                          segmentation binaries link against (ldd-verified)
+#
+# warp-lang (the opt-in GPU morphometrics backend, 371 MB) is deliberately
+# not installed: its import is guarded and the CPU path takes over. To use
+# GPU morphometrics in a container, derive an image with
+# `RUN python -m pip install warp-lang`, or use the wsl/native runner.
+name: cftree-runtime
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - pandas
+  - geopandas-base
+  - shapely
+  - pyproj
+  - pyogrio
+  - rasterio
+  - laspy
+  - lazrs-python
+  - python-pdal
+  - trimesh
+  - requests
+  - gmp
+  - mpfr
+  - libstdcxx
+  - pip
+  - pip:
+      - embreex==2.17.7.post7

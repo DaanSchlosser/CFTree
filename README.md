@@ -83,9 +83,13 @@ conda activate cftree
 
 ## Run with Docker
 
-The Docker image bakes the conda environment, the pipeline source, and the two
-compiled C++ binaries, so a colleague runs CFTree without a manual WSL setup, a
-conda environment, or a C++ toolchain. The only prerequisite is Docker.
+The Docker image bakes a pruned runtime environment
+(`docker/environment.runtime.yml`), the pipeline source, and the two compiled
+C++ binaries, so a colleague runs CFTree without a manual WSL setup, a conda
+environment, or a C++ toolchain. The only prerequisite is Docker. The image is
+built in stages: the C++ toolchain and the development tools from
+`environment.yml` never enter the published image, which keeps it a fraction
+of the size of the development environment.
 
 Pull the prebuilt image, published by CI from every verified push to `main`:
 
@@ -128,19 +132,21 @@ image is a GPL-3.0 distribution, consistent with this repository's licence.
 
 A smoke test ships with the image and confirms the build is healthy without a
 network download or a sample dataset. It checks that the baked environment
-imports the geospatial stack and that both compiled binaries run on tiny
-synthetic point clouds, which catches a binary that compiled but cannot load its
-shared libraries at runtime:
+imports the geospatial stack, that the PDAL stages, OGR drivers, and LAZ
+backend the pipeline uses are all present in the pruned environment, and that
+both compiled binaries run on tiny synthetic point clouds, which catches a
+binary that compiled but cannot load its shared libraries at runtime:
 
 ```bash
 docker run --rm cftree:local python /opt/cftree/docker/smoke_test.py
 ```
 
 A GitHub Actions workflow (`.github/workflows/docker-smoke.yml`) builds the
-image, runs this same smoke test plus the pytest suite inside the image on every
-change to the Dockerfile, the environment, or the source, and publishes the
-verified image to `ghcr.io/daanschlosser/cftree` on pushes to `main`, so a broken
-build is caught in CI rather than on a colleague's first run.
+image, runs this same smoke test, and runs the pytest suite in the image's
+`test` stage (the published image plus pytest) on every change to the
+Dockerfile, the image environments, or the source, and publishes the verified
+image to `ghcr.io/daanschlosser/cftree` on pushes to `main`, so a broken build
+is caught in CI rather than on a colleague's first run.
 
 ## Performance: data acquisition (get_data)
 
@@ -255,15 +261,24 @@ fails, the run falls back to the existing CPU path with no change in output.
 CFTREE_GPU_METRICS=1 python main.py --case wippolder --ahn-version 6 --n-cores 8 --buffer 20 --overwrite
 ```
 
-In the container, pass the GPU through and set the flag:
+The published image does not bake the Warp backend (`warp-lang`, 371 MB), so
+in a container the GPU path needs a derived image with the package added:
+
+```dockerfile
+FROM ghcr.io/daanschlosser/cftree:latest
+RUN python -m pip install --no-cache-dir warp-lang
+```
+
+Run the derived image with the GPU passed through and the flag set:
 
 ```bash
-docker run --rm --gpus all -e CFTREE_GPU_METRICS=1 -v "$PWD":/work cftree:local \
+docker run --rm --gpus all -e CFTREE_GPU_METRICS=1 -v "$PWD":/work cftree:gpu \
     python main.py --case wippolder --ahn-version 6 --n-cores 8 --buffer 20 --overwrite
 ```
 
 `--gpus all` needs an NVIDIA driver on the host and the nvidia-container-toolkit,
-which Docker Desktop provides through its WSL2 backend.
+which Docker Desktop provides through its WSL2 backend. Without the package or
+without a GPU, runs behave exactly as on CPU.
 
 Before enabling the GPU path on real data, validate it against the CPU baseline.
 The benchmark harness times the two metrics and diffs the GPU result against the

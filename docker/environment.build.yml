@@ -1,0 +1,30 @@
+# Build-stage environment for the Docker image: only what compiling the two
+# C++ binaries (awrap_points, segmentation) needs. Nothing from this
+# environment ships in the final image; the binaries' runtime libraries
+# (libgmp, libmpfr, libstdc++) come from environment.runtime.yml instead.
+#
+# cgal-cpp is the headers-and-cmake-only CGAL package; the plain `cgal`
+# package would add its 38 MB of unused SWIG python bindings on top.
+#
+# cgal-cpp, boost, and eigen are pinned to the series the binaries have
+# always been compiled against. Unpinned, a fresh solve drifts onto new
+# majors: Eigen past 3.4 is not parsed by CGAL 5.6's bundled FindEigen3.cmake
+# (the configure step fails on version ".."), and CGAL 6 changed APIs the
+# AlphaWrap code was not written for.
+name: cftree-build
+channels:
+  - conda-forge
+
+dependencies:
+  - cmake
+  - make
+  - gxx_linux-64
+  # The old glibc headers the compiler targets. Unpinned, the solver picks
+  # the newest sysroot, whose strtod family carries GLIBC_2.38 symbol
+  # versions that the debian-12 final stage (glibc 2.36) cannot load.
+  - sysroot_linux-64=2.28
+  - boost-cpp=1.84
+  - eigen=3.4
+  - cgal-cpp=5.6
+  - gmp
+  - mpfr

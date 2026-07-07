@@ -67,6 +67,57 @@ def check_imports() -> None:
     import shapely  # noqa: F401
 
 
+def check_drivers() -> None:
+    """The pruned runtime environment keeps every driver the pipeline uses.
+
+    The image installs libpdal-core and libgdal-core rather than the full
+    pdal/gdal metapackages, so this check pins down that the specific PDAL
+    stages, OGR drivers, LAZ backend, and CLI tools the pipeline calls are
+    all present. A packaging change that silently moves one of them into a
+    plugin package fails here rather than mid-run on real data.
+    """
+    # PDAL stages used by extract_dtm.py, stream_copc.py, and
+    # tiles_clipper_robust.sh; the CLI itself is used by the clip script.
+    result = subprocess.run(["pdal", "--drivers"], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"pdal --drivers exited {result.returncode}: {result.stderr.strip()[:400]}")
+    for stage in ("readers.las", "readers.copc", "writers.las", "writers.gdal",
+                  "filters.merge", "filters.crop", "filters.range", "filters.csf"):
+        if stage not in result.stdout:
+            raise RuntimeError(f"PDAL stage {stage} missing from this build")
+
+    # ogrinfo extracts the clip polygon WKT in tiles_clipper_robust.sh.
+    result = subprocess.run(["ogrinfo", "--version"], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ogrinfo exited {result.returncode}: {result.stderr.strip()[:400]}")
+
+    # geopandas IO goes through pyogrio: GeoJSON read/write, Shapefile read.
+    import pyogrio
+
+    drivers = pyogrio.list_drivers()
+    for name in ("GeoJSON", "ESRI Shapefile"):
+        if name not in drivers:
+            raise RuntimeError(f"OGR driver {name} missing from libgdal")
+
+    # laspy needs a LAZ compression backend (lazrs) for every .laz read.
+    import laspy
+
+    if not laspy.LazBackend.detect_available():
+        raise RuntimeError("laspy has no LAZ backend (lazrs missing)")
+
+    # trimesh mesh.contains() must run on embree (embreex); the pure-Python
+    # fallback is orders of magnitude slower and can exhaust memory.
+    import embreex  # noqa: F401
+    import trimesh
+
+    sphere = trimesh.creation.icosphere()
+    inside = sphere.contains([[0.0, 0.0, 0.0]])
+    if not bool(inside[0]):
+        raise RuntimeError("trimesh contains() gave a wrong result for the sphere centre")
+
+    print("      drivers: pdal stages, ogrinfo, GeoJSON/Shapefile, lazrs, embreex all present")
+
+
 def check_pipeline_help() -> None:
     """The entrypoint activates the env and main.py runs far enough to parse args."""
     result = subprocess.run(
@@ -160,6 +211,7 @@ def check_alpha_wrap() -> None:
 
 CHECKS: tuple[tuple[str, Callable[[], None]], ...] = (
     ("conda env imports the geospatial stack", check_imports),
+    ("pipeline drivers and backends are present", check_drivers),
     ("main.py --help runs under the entrypoint", check_pipeline_help),
     ("segmentation binary runs on synthetic data", check_segmentation),
     ("alpha-wrap binary runs on synthetic data", check_alpha_wrap),

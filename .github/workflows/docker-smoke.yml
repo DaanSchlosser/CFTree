@@ -1,13 +1,17 @@
 name: Docker image
 
 # Build the CFTree image, prove it works, and publish it. The build alone
-# exercises the slow parts that only break in a container (the conda env solve
-# and the two C++ compiles, including the GCC/CGAL patch); the smoke test then
-# runs both compiled binaries on synthetic point clouds, with no network
-# download and no large fixture; the pytest suite runs inside the image against
-# the baked source. Pushes to main that pass all checks are published to GHCR
-# as ghcr.io/<owner>/cftree with :latest, :v<version>, and :sha-<commit> tags,
+# exercises the slow parts that only break in a container (the conda env
+# solves and the two C++ compiles, including the GCC/CGAL patch); the smoke
+# test then runs the driver checks and both compiled binaries on synthetic
+# point clouds, with no network download and no large fixture; the pytest
+# suite runs inside the test-stage image, which is the published image plus
+# pytest, so the suite exercises the exact dependency set a consumer gets.
+# Pushes to main that pass all checks are published to GHCR as
+# ghcr.io/<owner>/cftree with :latest, :v<version>, and :sha-<commit> tags,
 # so consumers can pull a prebuilt image instead of building locally.
+# environment.yml is the development environment and no longer feeds the
+# image; the image environments live under docker/.
 
 on:
   push:
@@ -15,25 +19,30 @@ on:
     paths:
       - Dockerfile
       - .dockerignore
-      - environment.yml
       - pyproject.toml
       - docker/**
       - src/**
       - scripts/**
       - tests/**
       - main.py
+      # resources/ and cases/ are baked into the image by COPY . . and the
+      # published image is the only source of them for no-clone consumers,
+      # so a change to either must republish.
+      - resources/**
+      - cases/**
       - .github/workflows/docker-smoke.yml
   pull_request:
     paths:
       - Dockerfile
       - .dockerignore
-      - environment.yml
       - pyproject.toml
       - docker/**
       - src/**
       - scripts/**
       - tests/**
       - main.py
+      - resources/**
+      - cases/**
       - .github/workflows/docker-smoke.yml
   workflow_dispatch:
 
@@ -72,20 +81,36 @@ jobs:
           context: .
           load: true
           tags: cftree:ci
-          # Cache the expensive environment layer across runs so a source-only
-          # change does not re-solve the conda environment.
+          # Cache the expensive environment layers across runs so a
+          # source-only change does not re-solve the conda environments.
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Build the test-stage image
+        # The test stage is the published image plus pytest; every other
+        # layer comes from the build above, so this is a cache hit plus one
+        # pip install.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          target: test
+          tags: cftree:ci-test
+          cache-from: type=gha
+
+      - name: Report the image size
+        run: docker image ls cftree
 
       - name: Run the in-image smoke test
         run: docker run --rm cftree:ci python /opt/cftree/docker/smoke_test.py
 
-      - name: Run the pytest suite in the image
-        # The tests are network-free and the image bakes both the source and the
-        # conda env, so running them in-image also pins the exact dependency set
-        # a consumer of the published image gets. The working directory must be
-        # the baked repository root so the tests can import the src package.
-        run: docker run --rm -w /opt/cftree cftree:ci python -m pytest tests -q
+      - name: Run the pytest suite in the test-stage image
+        # The tests are network-free and the test image differs from the
+        # published one only by pytest itself, so the suite pins the exact
+        # dependency set a consumer of the published image gets. The working
+        # directory must be the baked repository root so the tests can import
+        # the src package.
+        run: docker run --rm -w /opt/cftree cftree:ci-test python -m pytest tests -q
 
       - name: Log in to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
