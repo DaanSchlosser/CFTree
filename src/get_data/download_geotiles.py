@@ -207,9 +207,7 @@ def _stream_download(url: str, dest: Path) -> None:
     tmp = dest.with_suffix(dest.suffix + f".{os.getpid()}.part")
     for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
         try:
-            with requests.get(
-                url, stream=True, allow_redirects=True, timeout=_REQUEST_TIMEOUT
-            ) as r:
+            with requests.get(url, stream=True, allow_redirects=True, timeout=_REQUEST_TIMEOUT) as r:
                 r.raise_for_status()
                 with tmp.open("wb") as f:
                     for chunk in r.iter_content(chunk_size=_CHUNK_SIZE):
@@ -221,17 +219,20 @@ def _stream_download(url: str, dest: Path) -> None:
             # Not transient (e.g. 403/404 out of coverage); let the caller decide.
             tmp.unlink(missing_ok=True)
             raise
+        # ChunkedEncodingError lives in requests.exceptions only (it is not
+        # re-exported at package level, so naming it as requests.Chunked...
+        # raised AttributeError the moment any transient error occurred and
+        # silently disabled these retries).
         except (
             requests.ConnectionError,
             requests.Timeout,
-            requests.ChunkedEncodingError,
+            requests.exceptions.ChunkedEncodingError,
         ) as e:
             tmp.unlink(missing_ok=True)
             if attempt == _DOWNLOAD_ATTEMPTS:
                 raise
             wait = _RETRY_BACKOFF_S * attempt
             logging.info(
-                f"Download stalled ({e.__class__.__name__}); "
-                f"retrying {attempt + 1}/{_DOWNLOAD_ATTEMPTS} in {wait}s"
+                f"Download stalled ({e.__class__.__name__}); retrying {attempt + 1}/{_DOWNLOAD_ATTEMPTS} in {wait}s"
             )
             time.sleep(wait)

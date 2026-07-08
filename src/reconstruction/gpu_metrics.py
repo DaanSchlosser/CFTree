@@ -158,9 +158,10 @@ def gpu_porosity(mesh: trimesh.Trimesh, pts_xyz: np.ndarray, voxel_size: float =
         if interior.size == 0:
             return np.nan
 
+        # Duplicate voxel indices are fine: the boolean assignment is
+        # idempotent, so no dedup (row-sort) is needed (mirrors the CPU path).
         ijk = np.floor((local_pts - bmin) / voxel_size).astype(int)
-        uniq, _ = np.unique(ijk, axis=0, return_index=True)
-        i, j, k = uniq.T
+        i, j, k = ijk.T
         valid = (i >= 0) & (i < nx) & (j >= 0) & (j < ny) & (k >= 0) & (k < nz)
         occ = np.zeros((ny, nx, nz), dtype=bool)
         occ[j[valid], i[valid], k[valid]] = True

@@ -23,6 +23,7 @@ from pathlib import Path
 
 import laspy
 import numpy as np
+import pandas as pd
 from scipy import ndimage as ndi
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
@@ -60,16 +61,28 @@ def read_laz(path: Path) -> laspy.LasData:
 
 
 def write_subset(src: laspy.LasData, mask: np.ndarray, out_path: Path) -> None:
+    # Temp name + rename so a killed run can never leave a truncated file the
+    # skip gate in filter_tile then trusts. The .part suffix hides the .laz
+    # extension from laspy's format inference, so compression is explicit.
     out_path.parent.mkdir(parents=True, exist_ok=True)
     hdr = copy.deepcopy(src.header)
     sub = laspy.LasData(hdr)
     sub.points = src.points[mask]
-    sub.write(out_path)
+    tmp = out_path.with_name(out_path.name + ".part")
+    sub.write(tmp, do_compress=True)
+    tmp.replace(out_path)
 
 
 def write_xyz_from_mask(xyz_all: np.ndarray, mask: np.ndarray, out_path: Path) -> None:
+    # pandas' C CSV writer produces byte-identical "%.6f %.6f %.6f\n" rows to
+    # np.savetxt but several times faster; savetxt formats each row in Python,
+    # which cost seconds per dense tile on a multi-million-point cloud.
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savetxt(out_path, xyz_all[mask], fmt="%.6f")
+    tmp = out_path.with_name(out_path.name + ".part")
+    pd.DataFrame(xyz_all[mask]).to_csv(
+        tmp, sep=" ", float_format="%.6f", header=False, index=False, lineterminator="\n"
+    )
+    tmp.replace(out_path)
 
 
 def scaled_xyz(las: laspy.LasData) -> np.ndarray:

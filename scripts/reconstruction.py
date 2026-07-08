@@ -67,7 +67,7 @@ import trimesh
 from scipy.spatial import cKDTree
 from trimesh import load as load_mesh
 
-from src.config import ResolvedConfig, get_config, setup_logger
+from src.config import get_config, setup_logger
 from src.reconstruction.alpha_wrap_tree import AlphaWrapServer, AlphaWrapTimeoutError
 from src.reconstruction.construct_geometry import construct_lod3
 from src.reconstruction.extract_tree_metrics import compute_tree_metrics
@@ -222,7 +222,6 @@ class _TilePlan:
 # ---------------------------------------------------------------------
 def process_batch(
     tile_dir: Path,
-    cfg: dict,
     gtids: list[int],
     tag: str,
     geometry_only: bool,
@@ -277,17 +276,22 @@ def process_batch(
     pending = [int(g) for g in gtids if int(g) not in completed and int(g) not in skipped]
 
     # Build a gtid -> point-indices map for just this batch's trees. Scanning
-    # `las["gtid"] == gid` per tree is O(N) per iteration; sorting once and
-    # bucketing is O(N log N + N) total. Done per batch (not per tile) so each
-    # batch only pays for the trees it owns.
+    # `las["gtid"] == gid` per tree is O(N) per iteration; masking down to the
+    # batch's own points first and sorting only those is O(N + M log M) with
+    # M << N, so a tile split into many batches does not re-sort all N points
+    # once per batch. The stable sort over ascending original indices keeps
+    # each tree's point order identical to a full-array sort.
     gtid_indices: dict[int, np.ndarray] = {}
     if pending:
         gtid_arr = las["gtid"]
-        sort_order = np.argsort(gtid_arr, kind="stable")
-        sorted_gtids = gtid_arr[sort_order]
-        starts = np.searchsorted(sorted_gtids, np.array(pending, dtype=gtid_arr.dtype))
-        ends = np.searchsorted(sorted_gtids, np.array(pending, dtype=gtid_arr.dtype), side="right")
-        gtid_indices = {gid: sort_order[s:e] for gid, s, e in zip(pending, starts, ends, strict=True)}
+        pending_arr = np.array(pending, dtype=gtid_arr.dtype)
+        batch_idx = np.flatnonzero(np.isin(gtid_arr, pending_arr))
+        batch_gtids = gtid_arr[batch_idx]
+        sort_order = np.argsort(batch_gtids, kind="stable")
+        sorted_gtids = batch_gtids[sort_order]
+        starts = np.searchsorted(sorted_gtids, pending_arr)
+        ends = np.searchsorted(sorted_gtids, pending_arr, side="right")
+        gtid_indices = {gid: batch_idx[sort_order[s:e]] for gid, s, e in zip(pending, starts, ends, strict=True)}
 
     logging.info(
         f"[{tile_id}] Batch {tag} start: {len(pending)} pending of {len(gtids)} assigned "
@@ -383,11 +387,11 @@ def process_batch(
 # ---------------------------------------------------------------------
 # Worker entry: configures logging then runs the batch
 # ---------------------------------------------------------------------
-def _worker_entry(tile_dir, cfg, gtids, tag, geometry_only, log_level, result_q):
-    setup_logger(cfg["case"], "tree_reconstruction", level=log_level)
+def _worker_entry(tile_dir, case, gtids, tag, geometry_only, log_level, result_q):
+    setup_logger(case, "tree_reconstruction", level=log_level)
     for noisy in ["trimesh", "rasterio", "fiona", "shapely"]:
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    process_batch(tile_dir, cfg, gtids, tag, geometry_only, result_q)
+    process_batch(tile_dir, gtids, tag, geometry_only, result_q)
 
 
 # ---------------------------------------------------------------------
@@ -395,7 +399,7 @@ def _worker_entry(tile_dir, cfg, gtids, tag, geometry_only, log_level, result_q)
 # ---------------------------------------------------------------------
 def _run_one_batch(
     batch: _Batch,
-    cfg: ResolvedConfig,
+    case: str,
     geometry_only: bool,
     log_level: str,
 ) -> dict:
@@ -417,16 +421,22 @@ def _run_one_batch(
     cache = tile.cache
     ctx = mp.get_context("spawn")
 
+    batch_gtid_set = set(batch.gtids)
+
+    def _n_completed() -> int:
+        return len({int(p.stem) for p in cache.trees_dir.glob("*.pkl")} & batch_gtid_set)
+
     consecutive_crashes = 0
     crashes_per_gtid: dict[int, int] = {}
     attempts = 0
+    progress_mark = _n_completed()
 
     while True:
         attempts += 1
         result_q: mp.Queue = ctx.Queue()
         proc = ctx.Process(
             target=_worker_entry,
-            args=(batch.tile_dir, cfg, batch.gtids, batch.tag, geometry_only, log_level, result_q),
+            args=(batch.tile_dir, case, batch.gtids, batch.tag, geometry_only, log_level, result_q),
             name=f"recon-{batch.tile_id}-{batch.tag}-a{attempts}",
         )
         proc.start()
@@ -459,6 +469,15 @@ def _run_one_batch(
         reason = "timeout" if timed_out else f"exitcode={proc.exitcode}"
         consecutive_crashes += 1
 
+        # The abandon threshold counts attempts that die WITHOUT progress; an
+        # attempt that completed trees before dying resets it, so a batch that
+        # is demonstrably converging (e.g. several pathological gtids, each
+        # needing _PATHOLOGY_THRESHOLD deaths to retire) is never abandoned.
+        now_completed = _n_completed()
+        if now_completed > progress_mark:
+            progress_mark = now_completed
+            consecutive_crashes = 0
+
         if marker:
             try:
                 bad_gtid = int(marker)
@@ -471,6 +490,10 @@ def _run_one_batch(
                 if count >= _PATHOLOGY_THRESHOLD:
                     _append_durable(cache.skipped, str(bad_gtid))
                     del crashes_per_gtid[bad_gtid]
+                    # Retiring a gtid resolves it, so it is progress too: a
+                    # batch holding several pathological trees converges by
+                    # retirement alone and must not be abandoned mid-way.
+                    consecutive_crashes = 0
                     logging.warning(
                         f"[{batch.tile_id}] Batch {batch.tag} died ({reason}) on GTID {bad_gtid} "
                         f"({count}x consecutive) — marked pathological and skipped permanently"
@@ -487,7 +510,7 @@ def _run_one_batch(
             )
 
         if consecutive_crashes >= _MAX_CONSECUTIVE_CRASHES:
-            n_done = len({int(p.stem) for p in cache.trees_dir.glob("*.pkl")} & set(batch.gtids))
+            n_done = _n_completed()
             logging.error(
                 f"[{batch.tile_id}] Abandoning batch {batch.tag} after {consecutive_crashes} crashes "
                 f"with no progress. Likely persistent environment issue."
@@ -500,7 +523,6 @@ def _run_one_batch(
 # ---------------------------------------------------------------------
 def finalize_tile(
     tile_dir: Path,
-    cfg: ResolvedConfig,
     geometry_only: bool,
     keep_cache: bool,
     unique_gtids: list[int],
@@ -543,21 +565,30 @@ def finalize_tile(
         return {"tile_id": tile_id, "status": "empty_tile"}
 
     city_final = finalize_cityjson(city)
-    # Compact separators: CityJSON is machine-read, and a tile holds hundreds of
-    # thousands of quantized-integer vertices. Dropping indentation whitespace
-    # both shrinks the file substantially and speeds serialization; the content
-    # is identical.
-    with open(tile.cityjson, "w", encoding="utf-8") as f:
-        json.dump(city_final, f, separators=(",", ":"))
-    logging.info(f"[{tile_id}] CityJSON written: {tile.cityjson.name} ({n_objects} trees, {len(skipped)} skipped)")
 
-    # Record which mode produced this CityJSON. A geometry-only output has null
-    # r50/porosity; the marker lets a later full run tell it from a complete one
-    # and rebuild rather than reuse the nulls (see _plan_tile).
+    # Record which mode produced this CityJSON BEFORE publishing it. A
+    # geometry-only output has null r50/porosity; the marker lets a later full
+    # run tell it from a complete one and rebuild rather than reuse the nulls
+    # (see _plan_tile). Marker first, then the atomic rename below: no kill
+    # point can leave a geometry-only CityJSON that reads as a full one.
     if geometry_only:
         _write_atomic(tile.geometry_only_marker, "1")
     else:
         tile.geometry_only_marker.unlink(missing_ok=True)
+
+    # Compact separators: CityJSON is machine-read, and a tile holds hundreds of
+    # thousands of quantized-integer vertices. Dropping indentation whitespace
+    # both shrinks the file substantially and speeds serialization; the content
+    # is identical. Temp name + rename so a run killed mid-dump (docker kill on
+    # timeout, OOM) can never leave a truncated CityJSON that every later run's
+    # exists-check trusts as the published result.
+    tmp = tile.cityjson.with_name(tile.cityjson.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(city_final, f, separators=(",", ":"))
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(tile.cityjson)
+    logging.info(f"[{tile_id}] CityJSON written: {tile.cityjson.name} ({n_objects} trees, {len(skipped)} skipped)")
 
     if not keep_cache:
         shutil.rmtree(cache.root, ignore_errors=True)
@@ -570,7 +601,6 @@ def finalize_tile(
 # ---------------------------------------------------------------------
 def _plan_tile(
     tile_dir: Path,
-    cfg: ResolvedConfig,
     overwrite: bool,
     geometry_only: bool,
     chunk_size: int,
@@ -720,9 +750,17 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Plan every tile, then run all their batches through one global pool.
     # ------------------------------------------------------------------
-    plans = [
-        _plan_tile(t, cfg, args.overwrite, args.geometry_only, args.chunk_size, args.max_trees) for t in tile_dirs
-    ]
+    # Planning decompresses each tile's forest.laz, which releases the GIL, so
+    # plan tiles concurrently rather than leaving every core idle while tiles
+    # are read one after another. Threads: each _plan_tile touches only its own
+    # tile's files, and the list order (hence batch order) is preserved.
+    with ThreadPoolExecutor(max_workers=max(1, n_cores)) as planner:
+        plans = list(
+            planner.map(
+                lambda t: _plan_tile(t, args.overwrite, args.geometry_only, args.chunk_size, args.max_trees),
+                tile_dirs,
+            )
+        )
 
     results: list[dict] = []
     work_plans: list[_TilePlan] = []
@@ -753,7 +791,7 @@ def main() -> int:
         if plan.tile_id in tile_failed:
             results.append({"tile_id": plan.tile_id, "status": "failed", "n_trees": 0})
             return
-        results.append(finalize_tile(plan.tile_dir, cfg, plan.geometry_only, args.keep_cache, plan.unique_gtids))
+        results.append(finalize_tile(plan.tile_dir, plan.geometry_only, args.keep_cache, plan.unique_gtids))
 
     # Tiles with zero batches: finalize straight away.
     for p in work_plans:
@@ -763,7 +801,7 @@ def main() -> int:
     if all_batches:
         with ThreadPoolExecutor(max_workers=max(1, n_cores)) as ex:
             futs = {
-                ex.submit(_run_one_batch, b, cfg, plan_by_tile[b.tile_id].geometry_only, args.log_level): b
+                ex.submit(_run_one_batch, b, case, plan_by_tile[b.tile_id].geometry_only, args.log_level): b
                 for b in all_batches
             }
             for fut in as_completed(futs):
@@ -777,13 +815,13 @@ def main() -> int:
                     _finalize(plan_by_tile[b.tile_id])
 
     for res in results:
-        logging.info(
-            f"[{res['tile_id']}] DONE status={res['status']} "
-            f"trees={res.get('n_trees', 0)}"
-        )
+        logging.info(f"[{res['tile_id']}] DONE status={res['status']} trees={res.get('n_trees', 0)}")
 
-    ok = [r for r in results if r["status"] in ("ok", "complete", "exists")]
-    failed = [r for r in results if r["status"] in ("failed", "stalled", "failed_max_attempts")]
+    # The stage's own terminal statuses: "complete"/"exists" succeed, "failed"
+    # (an abandoned batch) fails; everything else (missing_input, invalid_input,
+    # empty_tile) is a non-fatal skip reported in the "other" line.
+    ok = [r for r in results if r["status"] in ("complete", "exists")]
+    failed = [r for r in results if r["status"] == "failed"]
     other = [r for r in results if r not in ok and r not in failed]
     logging.info(f"Reconstruction summary: {len(ok)}/{len(results)} ok")
     if failed:

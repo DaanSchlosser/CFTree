@@ -31,6 +31,7 @@ import pdal
 import requests
 from shapely.geometry.base import BaseGeometry
 
+from src.get_data.acquired_region import acquired_region_covers, record_acquired_region
 from src.get_data.tile_sources import TileSource
 from src.stages import DownloadResult, RemoteUnavailableError, StageFailureError
 from src.tile_layout import CaseLayout
@@ -70,8 +71,13 @@ def stream_tile_region(
         raise StageFailureError(f"{source.name} is not a streaming (COPC) source")
 
     if tile.raw_laz.exists() and not overwrite:
-        logging.info(f"[{tile_id}] Skipping existing region read")
-        return DownloadResult(laz=tile.raw_laz, lax=None, did_work=False)
+        # Reuse only when the recorded acquisition region covers the requested
+        # one: a streamed raw.laz holds nothing outside the region it was read
+        # with, so a rerun with a larger --buffer/--halo-margin must re-stream.
+        if acquired_region_covers(tile.raw_laz, region):
+            logging.info(f"[{tile_id}] Skipping existing region read")
+            return DownloadResult(laz=tile.raw_laz, lax=None, did_work=False)
+        logging.info(f"[{tile_id}] Existing raw.laz does not cover the requested region — re-streaming")
 
     # Coverage probe: AHN6's first release covers the northeast only, and
     # basisdata.nl's Ceph backend can answer 403 for a missing object. Follow
@@ -83,11 +89,16 @@ def stream_tile_region(
     if resp.status_code in (403, 404):
         raise RemoteUnavailableError(f"COPC HTTP {resp.status_code} at {url}")
 
+    # Write to a temp name and rename on success, so a run killed mid-stream
+    # (docker kill on timeout, OOM) can never leave a truncated raw.laz that a
+    # later run's existence check trusts. writers.las takes the format from the
+    # stage type, not the filename, so the .part name still writes LAZ.
+    tmp = tile.raw_laz.with_name(tile.raw_laz.name + ".part")
     pipeline = [
         {"type": "readers.copc", "filename": url, "polygon": region.wkt},
         {
             "type": "writers.las",
-            "filename": str(tile.raw_laz),
+            "filename": str(tmp),
             "compression": True,
             "minor_version": 4,
             "dataformat_id": 8,
@@ -97,15 +108,18 @@ def stream_tile_region(
     try:
         n = pdal.Pipeline(json.dumps(pipeline)).execute()
     except RuntimeError as e:
-        tile.raw_laz.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
         raise StageFailureError(f"COPC region read failed for {tile_id}: {e}") from e
 
     if n == 0:
         # No points for this cell inside the region (e.g. a tile the AOI only
         # nicks at a corner). Leave no raw.laz so the tile drops out of `present`,
         # matching how an out-of-coverage tile is simply absent downstream.
+        tmp.unlink(missing_ok=True)
         tile.raw_laz.unlink(missing_ok=True)
         raise RemoteUnavailableError(f"no COPC points in AOI region for {tile_id}")
 
+    tmp.replace(tile.raw_laz)
+    record_acquired_region(tile.raw_laz, region)
     logging.info(f"[{tile_id}] Streamed {n:,} points from COPC region → raw.laz")
     return DownloadResult(laz=tile.raw_laz, lax=None, did_work=True)

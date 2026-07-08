@@ -132,8 +132,10 @@ def main() -> int:
 
     gpu_on = gpu_metrics.gpu_available()
     print(f"GPU available: {gpu_on}  (Warp+cuPy+CUDA device)")
-    print(f"{'tree':>5} | {'r50_cpu':>8} {'r50_gpu':>8} {'dr50':>7} | "
-          f"{'por_cpu':>8} {'por_gpu':>8} {'dpor':>7} | {'cpu_s':>7} {'gpu_s':>7}")
+    print(
+        f"{'tree':>5} | {'r50_cpu':>8} {'r50_gpu':>8} {'dr50':>7} | "
+        f"{'por_cpu':>8} {'por_gpu':>8} {'dpor':>7} | {'cpu_s':>7} {'gpu_s':>7}"
+    )
 
     cpu_r50_t = cpu_por_t = gpu_r50_t = gpu_por_t = 0.0
     n = r50_fail = por_fail = 0
@@ -151,29 +153,39 @@ def main() -> int:
                 r50_fail += 1
             if np.isfinite(dpor) and dpor > args.porosity_tol:
                 por_fail += 1
-            print(f"{idx:>5} | {r50_c:8.4f} {r50_g:8.4f} {dr50:7.4f} | "
-                  f"{por_c:8.4f} {por_g:8.4f} {dpor:7.4f} | {r50_ct + por_ct:7.3f} {r50_gt + por_gt:7.3f}")
+            print(
+                f"{idx:>5} | {r50_c:8.4f} {r50_g:8.4f} {dr50:7.4f} | "
+                f"{por_c:8.4f} {por_g:8.4f} {dpor:7.4f} | {r50_ct + por_ct:7.3f} {r50_gt + por_gt:7.3f}"
+            )
         else:
-            print(f"{idx:>5} | {r50_c:8.4f} {'-':>8} {'-':>7} | {por_c:8.4f} {'-':>8} {'-':>7} | "
-                  f"{r50_ct + por_ct:7.3f} {'-':>7}")
+            print(
+                f"{idx:>5} | {r50_c:8.4f} {'-':>8} {'-':>7} | {por_c:8.4f} {'-':>8} {'-':>7} | "
+                f"{r50_ct + por_ct:7.3f} {'-':>7}"
+            )
         n += 1
 
     if n == 0:
         raise SystemExit("No trees processed.")
 
     print("\n--- summary over", n, "trees ---")
-    print(f"CPU: r50 {cpu_r50_t:.2f}s  porosity {cpu_por_t:.2f}s  "
-          f"total {cpu_r50_t + cpu_por_t:.2f}s  (r50 {100 * cpu_r50_t / (cpu_r50_t + cpu_por_t):.0f}% / "
-          f"porosity {100 * cpu_por_t / (cpu_r50_t + cpu_por_t):.0f}%)")
+    print(
+        f"CPU: r50 {cpu_r50_t:.2f}s  porosity {cpu_por_t:.2f}s  "
+        f"total {cpu_r50_t + cpu_por_t:.2f}s  (r50 {100 * cpu_r50_t / (cpu_r50_t + cpu_por_t):.0f}% / "
+        f"porosity {100 * cpu_por_t / (cpu_r50_t + cpu_por_t):.0f}%)"
+    )
     if gpu_on:
         gpu_total = gpu_r50_t + gpu_por_t
         cpu_total = cpu_r50_t + cpu_por_t
         print(f"GPU: r50 {gpu_r50_t:.2f}s  porosity {gpu_por_t:.2f}s  total {gpu_total:.2f}s")
         if gpu_total > 0:
-            print(f"Speedup: r50 {cpu_r50_t / gpu_r50_t:.1f}x  porosity {cpu_por_t / gpu_por_t:.1f}x  "
-                  f"overall {cpu_total / gpu_total:.1f}x")
-        print(f"Validation: r50 within {args.r50_tol} m on {n - r50_fail}/{n}; "
-              f"porosity within {args.porosity_tol} on {n - por_fail}/{n}")
+            print(
+                f"Speedup: r50 {cpu_r50_t / gpu_r50_t:.1f}x  porosity {cpu_por_t / gpu_por_t:.1f}x  "
+                f"overall {cpu_total / gpu_total:.1f}x"
+            )
+        print(
+            f"Validation: r50 within {args.r50_tol} m on {n - r50_fail}/{n}; "
+            f"porosity within {args.porosity_tol} on {n - por_fail}/{n}"
+        )
         if r50_fail or por_fail:
             print("FAIL: GPU output drifted beyond tolerance on some trees -- do not enable CFTREE_GPU_METRICS yet.")
             return 1

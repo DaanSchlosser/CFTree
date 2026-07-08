@@ -59,12 +59,13 @@ def format_crs_uri(crs_str: str | None) -> str | None:
 # ---------------------------------------------------------------------
 # Geometry helpers
 # ---------------------------------------------------------------------
-def _append_vertices(city: dict, verts_global: np.ndarray) -> tuple[list[list[float]], int]:
+def _append_vertices(city: dict, verts_global: np.ndarray) -> int:
+    """Append the component's vertices and return the index they start at."""
     vbase = len(city["vertices"])
     n = len(verts_global)
     city["vertices"].extend(verts_global.tolist())
     logging.debug(f"[cityjson] Appended {n} vertices (vbase={vbase}, range={vbase}–{vbase + n - 1})")
-    return verts_global.tolist(), vbase
+    return vbase
 
 
 def _solid_from_faces(faces: np.ndarray, base_index: int) -> dict:
@@ -90,19 +91,6 @@ def _solid_from_faces(faces: np.ndarray, base_index: int) -> dict:
     logging.debug(f"[cityjson] Solid built with {len(faces)} faces (vbase={base_index}, first_faces={preview})")
 
     return solid
-
-
-def _compute_bbox(city: dict) -> list[float]:
-    """Compute correct bbox [xmin, ymin, zmin, xmax, ymax, zmax]."""
-    verts = np.asarray(city["vertices"], dtype=float)
-    if verts.ndim != 2 or verts.shape[1] != 3:
-        logging.warning("[cityjson] Invalid vertex array shape for bbox computation.")
-        return [0, 0, 0, 0, 0, 0]
-    mins = np.nanmin(verts, axis=0)
-    maxs = np.nanmax(verts, axis=0)
-    bbox = [float(mins[0]), float(mins[1]), float(mins[2]), float(maxs[0]), float(maxs[1]), float(maxs[2])]
-    logging.debug(f"[cityjson] Bounding box computed: {bbox}")
-    return bbox
 
 
 # ---------------------------------------------------------------------
@@ -140,7 +128,7 @@ def add_tree(
         )
 
         verts_global = verts_local + offset
-        _, vbase = _append_vertices(city, verts_global)
+        vbase = _append_vertices(city, verts_global)
 
         solid = _solid_from_faces(faces, vbase)
         solid["lod"] = comp.get("lod", 3.0)
@@ -170,9 +158,9 @@ def finalize_cityjson(city: dict, crs: str | None = None) -> dict:
     Finalize CityJSON by quantizing vertices, adding transform and metadata.
     """
     if crs is None:
-        from src.config import get_config
+        from src.config import DEFAULT_CONFIG
 
-        crs = get_config()["crs"]
+        crs = DEFAULT_CONFIG["crs"]
 
     if not city["vertices"]:
         logging.warning("[cityjson] No vertices to finalize — returning empty CityJSON.")

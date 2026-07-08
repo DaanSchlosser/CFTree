@@ -4,12 +4,12 @@
 
 #!/usr/bin/env python3
 """
-scripts/run_tree_segmentation.py
+scripts/segmentation.py
 
 Step 2: Vegetation filtering (HOMED) + Segmentation (TreeSeparation) + Forest ID generalization.
 
 Example:
-    nohup python -m scripts.run_tree_segmentation --case wippolder --n-cores 4 &
+    python -m scripts.segmentation --case wippolder --n-cores 4
 """
 
 import argparse
@@ -159,8 +159,17 @@ def main() -> int:
         # Check per-tile forest.laz presence
         missing_forest_tiles = [td.name for td in tile_dirs if not TileLayout(td).forest_laz.exists()]
 
-        # Skip only if case-level outputs exist AND all tiles already have forest.laz
-        if out_forest_hulls.exists() and out_gtid_map.exists() and not missing_forest_tiles and not args.overwrite:
+        # Skip only if the last generalization ran to completion (its marker
+        # guards against a kill mid-rewrite leaving tiles on two different GTID
+        # numberings, which per-file existence cannot detect), the case-level
+        # outputs exist, and all tiles already have forest.laz.
+        if (
+            layout.generalize_marker.exists()
+            and out_forest_hulls.exists()
+            and out_gtid_map.exists()
+            and not missing_forest_tiles
+            and not args.overwrite
+        ):
             logging.info(
                 "Forest generalization outputs already exist and all tiles have forest.laz — "
                 "skipping (use --overwrite to regenerate)."

@@ -56,6 +56,18 @@ def test_clip_signature_is_order_independent(tmp_path: Path) -> None:
     assert clip_signature(region, inputs) == clip_signature(region, list(reversed(inputs)))
 
 
+def test_clip_signature_distinguishes_neighbours_with_the_same_basename(tmp_path: Path) -> None:
+    # Every pipeline input is named raw.laz (one per tile directory), so the
+    # signature must identify inputs by their tile, not their basename: a
+    # changed neighbour set of equal size must invalidate the clip.
+    region = tmp_path / "clip_region.geojson"
+    region.write_text('{"coordinates": [[0, 0]]}')
+    own = tmp_path / "tiles" / "000012_304000" / "raw.laz"
+    with_east = clip_signature(region, [own, tmp_path / "tiles" / "000013_304000" / "raw.laz"])
+    with_north = clip_signature(region, [own, tmp_path / "tiles" / "000012_305000" / "raw.laz"])
+    assert with_east != with_north
+
+
 def test_clip_cache_valid_only_on_exact_match(tmp_path: Path) -> None:
     sig_path = tmp_path / "clipped.laz.clipsig"
     # A missing sidecar (e.g. a clip from before this guard) is a mismatch.

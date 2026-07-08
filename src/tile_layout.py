@@ -39,7 +39,6 @@ class TileCacheLayout:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.trees_dir = root / "trees"
-        self.in_flight = root / "in_flight.txt"
         self.skipped = root / "skipped.txt"
 
     def tree_xyz(self, gtid: int) -> Path:
@@ -189,6 +188,17 @@ class CaseLayout:
         return self.data_dir / "gtid_map.csv"
 
     @property
+    def generalize_marker(self) -> Path:
+        """Present iff the last forest-ID generalization ran to completion.
+
+        `generalize_forest_ids` removes it before rewriting anything and writes
+        it only after every tile's forest.laz enrichment succeeded, so the
+        segmentation skip gate can tell a consistent hulls/map/forest.laz set
+        from one left half-rewritten by an interrupted run — per-file existence
+        alone cannot (each file individually exists in both states)."""
+        return self.data_dir / ".forest_generalize_complete"
+
+    @property
     def tile_source_manifest(self) -> Path:
         """Records the AHN version/source used for this case (written by get_data).
 
@@ -201,8 +211,3 @@ class CaseLayout:
     # --- traversal ---
     def tile(self, tile_id: str) -> TileLayout:
         return TileLayout(self.tiles_dir / tile_id)
-
-    def iter_tiles(self) -> list[TileLayout]:
-        if not self.tiles_dir.exists():
-            return []
-        return [TileLayout(p) for p in sorted(self.tiles_dir.iterdir()) if p.is_dir()]

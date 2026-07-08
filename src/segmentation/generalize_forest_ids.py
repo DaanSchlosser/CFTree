@@ -123,7 +123,12 @@ def _write_forest_laz(tile_dir: Path, tile_map: pd.DataFrame) -> tuple[str, int,
         if "gtid" not in las_out.point_format.extra_dimension_names:
             las_out.add_extra_dim(laspy.ExtraBytesParams(name="gtid", type=np.uint32))
         las_out["gtid"] = merged["gtid"].astype(np.uint32).values
-        las_out.write(out_forest)
+        # Temp name + rename so a killed run can never leave a truncated
+        # forest.laz; the .part suffix hides the .laz extension from laspy's
+        # format inference, so compression is explicit.
+        tmp = out_forest.with_name(out_forest.name + ".part")
+        las_out.write(tmp, do_compress=True)
+        tmp.replace(out_forest)
     except Exception as e:
         logging.error(f"[{name}] Failed writing forest.laz: {e}")
         return name, 0, FOREST_ENRICH_FAILED
@@ -211,6 +216,12 @@ def generalize_forest_ids(case: str, n_cores: int = 1) -> GeneralizeForestIdsRes
     layout = CaseLayout.from_config(cfg)
     tiles_dir = layout.tiles_dir
 
+    # Drop the completion marker before touching any output. The caller's skip
+    # gate requires it, so a regeneration killed between rewriting the global
+    # numbering and finishing the per-tile forest.laz enrichment leaves no
+    # marker and is fully re-run, never resumed over a mixed-numbering state.
+    layout.generalize_marker.unlink(missing_ok=True)
+
     aoi_path = layout.aoi
     if not aoi_path.exists():
         raise MissingPrerequisiteError(f"AOI not found: {aoi_path}")
@@ -246,33 +257,49 @@ def generalize_forest_ids(case: str, n_cores: int = 1) -> GeneralizeForestIdsRes
     for tile_dir in sorted(tiles_dir.iterdir()):
         logging.debug(f"Entering tile: {tile_dir}")
 
-        hull_path = TileLayout(tile_dir).tree_hulls
+        tile = TileLayout(tile_dir)
+        hull_path = tile.tree_hulls
         if not hull_path.exists():
             continue
+        # An unreadable hulls file on an expected tile is corruption (e.g. a
+        # writer killed mid-file before the atomic-write guard existed), not a
+        # foreign directory. Silently skipping it would drop the whole tile's
+        # trees from the case on every rerun, so self-heal instead: remove the
+        # corrupt pair and fail the stage, and the next segmentation run
+        # regenerates the tile.
         try:
             gdf = gpd.read_file(hull_path).to_crs(cfg["crs"])
-            gdf["tile_id"] = tile_dir.name
-            gdf["centroid"] = gdf.geometry.centroid
-            present_tile_ids.append(tile_dir.name)
-
-            cx = gdf["centroid"].x.to_numpy()
-            cy = gdf["centroid"].y.to_numpy()
-            # Outer gate: inside the study AOI. Inner gate: owned by THIS tile's
-            # core cell (the half-open partition rule lives in TileSource), so a
-            # tree present in two overlapping tiles is kept by exactly one.
-            # owns_centroids → core_cell raises for a foreign/stale tile dir,
-            # which the except below logs and skips.
-            in_aoi = gdf["centroid"].within(aoi_geom).to_numpy()
-            owned = source.owns_centroids(tile_dir.name, cx, cy)
-
-            kept = gdf[in_aoi & owned]
-            if not kept.empty:
-                hulls_all.append(kept)
-            orphan = gdf[in_aoi & ~owned]
-            if not orphan.empty:
-                orphans.append(orphan)
         except Exception as e:
-            logging.warning(f"[{tile_dir.name}] Failed reading/owning hulls: {e}")
+            hull_path.unlink(missing_ok=True)
+            tile.segmentation_xyz.unlink(missing_ok=True)
+            raise StageFailureError(
+                f"[{tile_dir.name}] Unreadable tree_hulls.geojson ({e}); removed it and "
+                "segmentation.xyz — re-run segmentation to regenerate the tile"
+            ) from e
+
+        gdf["tile_id"] = tile_dir.name
+        gdf["centroid"] = gdf.geometry.centroid
+        cx = gdf["centroid"].x.to_numpy()
+        cy = gdf["centroid"].y.to_numpy()
+        # Outer gate: inside the study AOI. Inner gate: owned by THIS tile's
+        # core cell (the half-open partition rule lives in TileSource), so a
+        # tree present in two overlapping tiles is kept by exactly one.
+        # owns_centroids → core_cell raises for a tile dir that is not part of
+        # this source's grid (a foreign/stale directory): log and skip it.
+        try:
+            owned = source.owns_centroids(tile_dir.name, cx, cy)
+        except Exception as e:
+            logging.warning(f"[{tile_dir.name}] Not a {source.name} tile ({e}) — skipping directory")
+            continue
+        present_tile_ids.append(tile_dir.name)
+
+        in_aoi = gdf["centroid"].within(aoi_geom).to_numpy()
+        kept = gdf[in_aoi & owned]
+        if not kept.empty:
+            hulls_all.append(kept)
+        orphan = gdf[in_aoi & ~owned]
+        if not orphan.empty:
+            orphans.append(orphan)
 
     if not hulls_all and not orphans:
         raise StageFailureError(f"No valid tree hulls found inside AOI for case {case}")
@@ -386,6 +413,10 @@ def generalize_forest_ids(case: str, n_cores: int = 1) -> GeneralizeForestIdsRes
     failed = forest_enrichment_failures(outcomes)
     if failed:
         raise StageFailureError(f"forest.laz enrichment failed for {len(failed)} tile(s): {failed}")
+
+    # Everything (numbering, hulls, map, every tile's forest.laz) is consistent
+    # on disk; only now may a later run's skip gate trust it.
+    layout.generalize_marker.write_text("complete\n")
 
     return GeneralizeForestIdsResult(
         n_trees=n_trees,

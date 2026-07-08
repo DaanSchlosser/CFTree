@@ -103,7 +103,7 @@ def test_shared_cache_dedups_across_cases_and_ignores_overwrite(tmp_path):
 
     with mock.patch.object(dl, "_stream_download", fake_stream):
         download_tile("30FZ1_22", case_a, src, overwrite=False)  # miss -> downloads
-        download_tile("30FZ1_22", case_b, src, overwrite=True)   # cache hit despite overwrite
+        download_tile("30FZ1_22", case_b, src, overwrite=True)  # cache hit despite overwrite
         download_tile("30HN1_02", case_a, src, overwrite=False)  # different tile -> downloads
 
     # The shared tile was fetched exactly once across the two cases.

@@ -149,12 +149,12 @@ class TileOutcome:
 # A stage's `main()` exits non-zero when its tile outcomes include any of
 # these, so the orchestrator (`main.py::run_stage`) aborts the pipeline
 # instead of letting a downstream consumer cache a partial run as complete.
-# Successes ("ok", "downloaded", "complete", "chunk_done", "exists") and
-# graceful skips are deliberately NOT failures: "not_in_coverage" is an AHN6
-# coverage gap (an expected skip, not an error), and "empty_tile" is a tile
-# with no trees (a valid result). Reconstruction's "missing_input" /
-# "invalid_input" are likewise left non-fatal, matching that stage's own
-# ok/failed/other split, so this set never reclassifies an existing outcome.
+# Successes ("ok", "downloaded", "complete", "exists") and graceful skips are
+# deliberately NOT failures: "not_in_coverage" is an AHN6 coverage gap (an
+# expected skip, not an error), and "empty_tile" is a tile with no trees (a
+# valid result). Reconstruction's "missing_input" / "invalid_input" are
+# likewise left non-fatal, matching that stage's own ok/failed/other split,
+# so this set never reclassifies an existing outcome.
 FAILURE_STATUSES: frozenset[str] = frozenset(
     {
         "download_failed",
@@ -167,8 +167,6 @@ FAILURE_STATUSES: frozenset[str] = frozenset(
         "seg_prereq_missing",
         "exception",
         "failed",
-        "stalled",
-        "failed_max_attempts",
     }
 )
 

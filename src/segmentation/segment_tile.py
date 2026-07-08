@@ -20,10 +20,11 @@ import subprocess
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
-from shapely.geometry import MultiPoint
+import shapely
 
-from src.config import get_config, resolve_native_binary
+from src.config import DEFAULT_CONFIG, resolve_native_binary
 from src.stages import MissingPrerequisiteError, SegmentationResult, StageFailureError
 from src.tile_layout import TileLayout
 
@@ -33,7 +34,11 @@ SEG_PARAMS = {
     "vres": 1.5,
     "min_pts": 3,
 }
-cfg = get_config()
+
+# Wall-clock bound for the C++ segmentation binary on one tile. Minutes at
+# worst on a dense tile; an hour means it is wedged, and without a bound a
+# bare (non-docker) run would stall forever with no per-tile failure reported.
+_SEG_TIMEOUT_S = 3600
 
 
 def segment_tile(tile_dir: Path, overwrite: bool = False) -> SegmentationResult:
@@ -63,10 +68,15 @@ def segment_tile(tile_dir: Path, overwrite: bool = False) -> SegmentationResult:
         logging.info(f"[{tile_id}] Segmentation already exists — skipping (use --overwrite to redo).")
         return SegmentationResult(segmentation_xyz=output_xyz, tree_hulls=hulls_geojson, did_work=False)
 
+    # The binary writes to a temp name that is renamed only after a clean exit,
+    # with the (stale) hulls removed first. The skip gate above trusts the
+    # existence of the xyz/hulls pair, so no kill point may leave a fresh xyz
+    # beside hulls from an earlier run — the pair would silently disagree.
+    tmp_xyz = output_xyz.with_name(output_xyz.name + ".part")
     cmd = [
         str(exe),
         str(input_xyz),
-        str(output_xyz),
+        str(tmp_xyz),
         str(SEG_PARAMS["radius"]),
         str(SEG_PARAMS["vres"]),
         str(SEG_PARAMS["min_pts"]),
@@ -74,25 +84,42 @@ def segment_tile(tile_dir: Path, overwrite: bool = False) -> SegmentationResult:
 
     logging.info(f"[{tile_id}] Running segmentation binary...")
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=_SEG_TIMEOUT_S)
     except subprocess.CalledProcessError as e:
+        tmp_xyz.unlink(missing_ok=True)
         raise StageFailureError(f"[{tile_id}] Segmentation failed: {e.stderr.strip()}") from e
+    except subprocess.TimeoutExpired as e:
+        tmp_xyz.unlink(missing_ok=True)
+        raise StageFailureError(f"[{tile_id}] Segmentation hung for {_SEG_TIMEOUT_S}s and was killed") from e
+    hulls_geojson.unlink(missing_ok=True)
+    tmp_xyz.replace(output_xyz)
 
     try:
         seg_df = pd.read_csv(output_xyz, sep=r"\s+", header=None, names=["tid", "x", "y", "z"])
-        seg_gdf = gpd.GeoDataFrame(seg_df, geometry=gpd.points_from_xy(seg_df.x, seg_df.y), crs=cfg["crs"])
 
-        hulls = []
-        for tid, group in seg_gdf.groupby("tid"):
-            if len(group) >= 3:
-                hull_geom = MultiPoint(group.geometry.values).convex_hull
-                hulls.append({"tid": tid, "geometry": hull_geom})
-            else:
-                logging.debug(f"[{tile_id}] Tree ID {tid} has <3 points — skipped.")
+        # Group points by tree id and hull each group in C (shapely 2), instead
+        # of a Python loop building a MultiPoint per pandas groupby slice —
+        # byte-identical hulls (same point multisets in the same order to the
+        # same GEOS routine), an order of magnitude faster on a dense tile.
+        codes, tids = pd.factorize(seg_df["tid"], sort=True)
+        order = np.argsort(codes, kind="stable")  # multipoints() needs sorted indices
+        points = shapely.points(seg_df["x"].to_numpy()[order], seg_df["y"].to_numpy()[order])
+        multipoints = shapely.multipoints(points, indices=codes[order])
+        counts = np.bincount(codes)
+        hull_geoms = shapely.convex_hull(multipoints)
+
+        enough = counts >= 3
+        for tid in tids[~enough]:
+            logging.debug(f"[{tile_id}] Tree ID {tid} has <3 points — skipped.")
+        hulls = [{"tid": tid, "geometry": geom} for tid, geom in zip(tids[enough], hull_geoms[enough], strict=True)]
 
         if hulls:
-            hulls_gdf = gpd.GeoDataFrame(hulls, crs=cfg["crs"])
-            hulls_gdf.to_file(hulls_geojson, driver="GeoJSON")
+            hulls_gdf = gpd.GeoDataFrame(hulls, crs=DEFAULT_CONFIG["crs"])
+            # Temp name + rename: the skip gate must never see a half-written
+            # hulls file (generalize_forest_ids reads every tile's hulls).
+            tmp_hulls = hulls_geojson.with_name(hulls_geojson.name + ".part")
+            hulls_gdf.to_file(tmp_hulls, driver="GeoJSON")
+            tmp_hulls.replace(hulls_geojson)
         else:
             logging.warning(f"[{tile_id}] No valid hulls produced.")
 

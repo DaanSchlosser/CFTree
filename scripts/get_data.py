@@ -4,12 +4,12 @@
 
 #!/usr/bin/env python3
 """
-scripts/run_get_data.py
+scripts/get_data.py
 
 Full pipeline for downloading and clipping AHN geotiles for a case.
 
 Example:
-    nohup python -m scripts.run_get_data --n-cores 2 --case emmer_compascuum &
+    python -m scripts.get_data --n-cores 2 --case emmer_compascuum
 """
 
 import argparse
@@ -26,7 +26,6 @@ from shapely.geometry import Polygon, box
 
 from src.config import get_config, setup_logger
 from src.get_data.clip_tile import clip_tile
-from src.get_data.download_geotiles import download_tile
 from src.get_data.extract_dtm import compute_tile_dtm
 from src.get_data.lax_partial import read_region
 from src.get_data.stream_copc import stream_tile_region
@@ -44,29 +43,6 @@ from src.tile_layout import CaseLayout
 # ---------------------------------------------------------------------
 # Tile workers (must be top-level for multiprocessing)
 # ---------------------------------------------------------------------
-def download_one(
-    tile_id: str,
-    output_dir: Path,
-    source: TileSource,
-    overwrite: bool,
-) -> TileOutcome:
-    """Sweep 1: download one tile's raw point cloud.
-
-    A separate sweep from clipping because a tile's clip now reads its
-    neighbours' raw clouds (the halo); all downloads must finish before any clip
-    starts, or which border points a clip sees would depend on download order.
-    """
-    try:
-        dl = download_tile(tile_id, output_dir, source, overwrite=overwrite)
-    except RemoteUnavailableError as e:
-        logging.info(f"[{tile_id}] Skipped: {e}")
-        return TileOutcome(tile_id=tile_id, status="not_in_coverage", detail=str(e))
-    except StageError as e:
-        logging.warning(f"[{tile_id}] Download failed: {e}")
-        return TileOutcome(tile_id=tile_id, status="download_failed", detail=str(e))
-    return TileOutcome(tile_id=tile_id, status="downloaded", paths={"raw": dl.laz})
-
-
 def stream_one(
     tile_id: str,
     output_dir: Path,
@@ -74,20 +50,15 @@ def stream_one(
     region: Polygon,
     overwrite: bool,
 ) -> TileOutcome:
-    """Sweep 1 (streaming sources): range-read one tile's AOI region from the remote file.
+    """Sweep 1 (hard-partitioned sources, i.e. AHN6 COPC): range-read one tile's AOI region.
 
     Instead of downloading a whole cell, reads only `region` (the tile's clip
-    region) over HTTP range requests, dispatching on the source's `acquire_mode`:
-    "copc" reads a Cloud-Optimized Point Cloud (AHN6), "lax" reads a plain LAZ
-    through its `.lax` index (AHN4/AHN5, falling back to a whole-tile download when
-    a partial read would not pay). The resulting `raw.laz` plugs into the same
-    clip sweep, so the rest of the pipeline is unchanged.
+    region) from the remote Cloud-Optimized Point Cloud over HTTP range
+    requests. The resulting `raw.laz` plugs into the same clip sweep, so the
+    rest of the pipeline is unchanged.
     """
     try:
-        if source.acquire_mode == "lax":
-            dl = read_region(tile_id, output_dir, source, region, overwrite=overwrite)
-        else:
-            dl = stream_tile_region(tile_id, output_dir, source, region, overwrite=overwrite)
+        dl = stream_tile_region(tile_id, output_dir, source, region, overwrite=overwrite)
     except RemoteUnavailableError as e:
         logging.info(f"[{tile_id}] Skipped: {e}")
         return TileOutcome(tile_id=tile_id, status="not_in_coverage", detail=str(e))
@@ -157,17 +128,16 @@ def acquire_clip_dtm_one(
 ) -> TileOutcome:
     """Fused per-tile pipeline for a self-contained source: acquire, clip, DTM.
 
-    Used when the source's tiles overlap enough to carry their own halo (GeoTiles
-    AHN4/AHN5), so a tile's clip needs only its own cloud and can start the moment
-    that tile is fetched, with no acquire/clip barrier. Different tiles then overlap
-    one tile's clip/DTM (CPU) with another's fetch (network). The clip is a single
-    input, matching the self-contained branch of the two-sweep path.
+    Used when the source's tiles overlap enough to carry their own halo (the
+    GeoTiles releases, AHN2-AHN5), so a tile's clip needs only its own cloud and
+    can start the moment that tile is fetched, with no acquire/clip barrier.
+    Different tiles then overlap one tile's clip/DTM (CPU) with another's fetch
+    (network). The clip is a single input, matching the self-contained branch of
+    the two-sweep path. `read_region` itself decides between a `.lax` partial
+    range read and a whole-tile download.
     """
     try:
-        if source.acquire_mode == "lax":
-            read_region(tile_id, output_dir, source, region, overwrite=overwrite)
-        else:
-            download_tile(tile_id, output_dir, source, overwrite=overwrite)
+        read_region(tile_id, output_dir, source, region, overwrite=overwrite)
     except RemoteUnavailableError as e:
         logging.info(f"[{tile_id}] Skipped: {e}")
         return TileOutcome(tile_id=tile_id, status="not_in_coverage", detail=str(e))
@@ -338,19 +308,13 @@ def main() -> int:
         # any clip starts (a barrier) or which border points a clip sees would
         # depend on acquisition order (non-deterministic). The streaming source
         # range-reads only each tile's AOI region from the remote file.
-        if source.is_streaming:
-            logging.info(f"Range-reading {len(tile_ids)} tile region(s) ({n_cores} workers)...")
-            read_cells = {tid: source.core_cell(tid) for tid in tile_ids}
-            acquire_tasks = [
-                (tid, output_dir, source, tile_clip_region(read_cells[tid], margin, buffered_geom), args.overwrite)
-                for tid in tile_ids
-            ]
-            download_outcomes = run_sweep(stream_one, acquire_tasks, n_cores)
-        else:
-            logging.info(f"Downloading {len(tile_ids)} tiles ({n_cores} workers)...")
-            download_outcomes = run_sweep(
-                download_one, [(tid, output_dir, source, args.overwrite) for tid in tile_ids], n_cores
-            )
+        logging.info(f"Range-reading {len(tile_ids)} tile region(s) ({n_cores} workers)...")
+        read_cells = {tid: source.core_cell(tid) for tid in tile_ids}
+        acquire_tasks = [
+            (tid, output_dir, source, tile_clip_region(read_cells[tid], margin, buffered_geom), args.overwrite)
+            for tid in tile_ids
+        ]
+        download_outcomes = run_sweep(stream_one, acquire_tasks, n_cores)
         download_failed = failed_statuses(o.status for o in download_outcomes)
 
         present = [tid for tid in tile_ids if layout.tile(tid).raw_laz.exists()]

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pdal
 
-from src.config import get_config
+from src.config import DEFAULT_CONFIG
 from src.stages import DtmResult, MissingPrerequisiteError, StageFailureError
 from src.tile_layout import TileLayout
 
@@ -41,9 +41,13 @@ def compute_tile_dtm(
         logging.debug(f"DTM already exists at {dtm_out} — skipped.")
         return DtmResult(dtm=dtm_out, did_work=False)
 
-    cfg = get_config()
-    crs = cfg["crs"]
+    crs = DEFAULT_CONFIG["crs"]
 
+    # Write to a temp name and rename on success, so a run killed mid-write can
+    # never leave a truncated GeoTIFF that the existence check above then feeds
+    # to every reconstruction worker. writers.gdal takes its driver (GTiff) from
+    # its own default, not the filename, so the .part name is fine.
+    tmp = dtm_out.with_name(dtm_out.name + ".part")
     pipeline_def: list = [
         str(clipped_las),
         {
@@ -60,7 +64,7 @@ def compute_tile_dtm(
     pipeline_def.append(
         {
             "type": "writers.gdal",
-            "filename": str(dtm_out),
+            "filename": str(tmp),
             "resolution": resolution,
             "output_type": "min",
             "nodata": -9999,
@@ -73,8 +77,10 @@ def compute_tile_dtm(
     try:
         pipeline.execute()
     except RuntimeError as e:
+        tmp.unlink(missing_ok=True)
         raise StageFailureError(f"PDAL pipeline failed for {clipped_las}: {e}") from e
 
+    tmp.replace(dtm_out)
     logging.info(f"DTM written to {dtm_out}")
     return DtmResult(dtm=dtm_out, did_work=True)
 

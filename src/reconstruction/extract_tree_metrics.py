@@ -104,10 +104,11 @@ def _compute_porosity(mesh: trimesh.Trimesh, pts_xyz: np.ndarray, voxel_size: fl
         if interior.size == 0:
             return np.nan
 
-        # Occupied voxels by vegetation points (local)
+        # Occupied voxels by vegetation points (local). Duplicate indices are
+        # fine: the boolean assignment is idempotent, so no dedup (row-sort) is
+        # needed and the grid is identical either way.
         ijk = np.floor((local_pts - bmin) / voxel_size).astype(int)
-        uniq, _ = np.unique(ijk, axis=0, return_index=True)
-        i, j, k = uniq.T
+        i, j, k = ijk.T
         valid = (i >= 0) & (i < nx) & (j >= 0) & (j < ny) & (k >= 0) & (k < nz)
         occ = np.zeros((ny, nx, nz), dtype=bool)
         occ[j[valid], i[valid], k[valid]] = True

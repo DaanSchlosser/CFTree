@@ -45,6 +45,7 @@ import numpy as np
 import requests
 from shapely.geometry.base import BaseGeometry
 
+from src.get_data.acquired_region import acquired_region_covers, record_acquired_region
 from src.get_data.download_geotiles import _default_cache_dir, _ensure_cached, download_tile
 from src.get_data.tile_sources import TileSource
 from src.stages import DownloadResult, RemoteUnavailableError, StageFailureError
@@ -297,11 +298,22 @@ class HttpRangeFile(io.RawIOBase):
                     self._url, headers=headers, timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT), allow_redirects=True
                 )
                 r.raise_for_status()
+                if r.status_code != 206 and not (start == 0 and end >= self._size):
+                    # A server (or intermediary) that ignores the Range header
+                    # answers 200 with the whole file; treating those bytes as
+                    # the requested range would decode garbage. Not a transient
+                    # fault, so no retry: raise past the requests-level handler
+                    # and let read_region's fallback download the whole tile.
+                    raise OSError(f"server ignored range request (HTTP {r.status_code}) at {self._url}")
                 data = r.content
                 self.bytes_fetched += len(data)
                 self.n_requests += 1
                 return data
-            except (requests.ConnectionError, requests.Timeout, requests.ChunkedEncodingError) as e:
+            # ChunkedEncodingError lives in requests.exceptions only (it is not
+            # re-exported at package level, so naming it as requests.Chunked...
+            # raised AttributeError the moment any transient error occurred and
+            # silently disabled these retries).
+            except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as e:
                 last = e
                 if attempt < _RANGE_ATTEMPTS:
                     time.sleep(_RETRY_BACKOFF_S * attempt)
@@ -343,7 +355,13 @@ def read_region(
     tile = CaseLayout(data_dir=output_dir).tile(tile_id)
     tile.dir.mkdir(parents=True, exist_ok=True)
 
-    if tile.raw_laz.exists() and not overwrite:
+    # Reuse an existing raw.laz only when its recorded acquisition region
+    # covers the requested one: a range-read raw.laz holds nothing outside the
+    # region it was read with, so a rerun with a larger --buffer/--halo-margin
+    # must re-acquire. A whole-tile raw.laz carries no sidecar and falls
+    # through to the cached-whole-tile branch below, which re-provisions it
+    # for the cost of a hardlink.
+    if tile.raw_laz.exists() and not overwrite and acquired_region_covers(tile.raw_laz, region):
         logging.info(f"[{tile_id}] Skipping existing region read")
         return DownloadResult(laz=tile.raw_laz, lax=None, did_work=False)
 
@@ -368,9 +386,17 @@ def _partial_or_whole(tile_id, output_dir, source, region, overwrite, cache_dir,
     if lax_url is None:
         return download_tile(tile_id, output_dir, source, overwrite=overwrite, cache_dir=cache_dir)
 
-    # Fetch (and cache) the small .lax, then size up the read.
+    # Fetch (and cache) the small .lax, then size up the read. A LAZ that exists
+    # without its .lax sidecar (or an unreachable sidecar) must not classify the
+    # tile as out of coverage — only the LAZ itself decides that — so any LAX
+    # fetch failure falls back to the whole-tile download, exactly like an
+    # unparseable index.
     lax_cache = cache_dir / f"{tile_id}.LAX"
-    _ensure_cached(url=lax_url, cache=lax_cache, tile_id=tile_id, label="LAX", required=True)
+    try:
+        _ensure_cached(url=lax_url, cache=lax_cache, tile_id=tile_id, label="LAX", required=True)
+    except (RemoteUnavailableError, StageFailureError) as e:
+        logging.info(f"[{tile_id}] LAX index unavailable ({e}); downloading whole tile")
+        return download_tile(tile_id, output_dir, source, overwrite=overwrite, cache_dir=cache_dir)
     index = LaxIndex(lax_cache.read_bytes())
     runs, fraction = index.select(region)
 
@@ -435,5 +461,12 @@ def _read_runs_to_laz(
     out = laspy.LasData(header)
     out.points = laspy.ScaleAwarePointRecord(merged, header.point_format, scales=header.scales, offsets=header.offsets)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    out.write(dest)
+    # Write to a temp name and rename on success, so a run killed mid-write can
+    # never leave a truncated raw.laz that a later run's existence check trusts.
+    # The .part suffix hides the .laz extension from laspy's format inference,
+    # so compression is requested explicitly.
+    tmp = dest.with_name(dest.name + ".part")
+    out.write(tmp, do_compress=True)
+    tmp.replace(dest)
+    record_acquired_region(dest, region)
     return len(merged), mb, reqs

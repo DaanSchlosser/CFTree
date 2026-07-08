@@ -12,6 +12,12 @@ from pathlib import Path
 
 from src.stages import ClipResult, MissingPrerequisiteError, StageFailureError
 
+# Wall-clock bound for one PDAL clip. A merge+crop of a tile plus neighbours
+# takes minutes at worst; an hour means PDAL is wedged on a pathological LAZ,
+# and without a bound a bare (non-docker) run would stall forever with no
+# per-tile failure reported.
+_CLIP_TIMEOUT_S = 3600
+
 
 def _clip_sig_path(output_path: Path) -> Path:
     """Sidecar recording the clip region + input set that produced *output_path*."""
@@ -26,10 +32,14 @@ def clip_signature(region_path: Path, inputs: list[Path]) -> str:
     inputs), so a ``clipped.laz`` from the old region must not be reused — its
     point support no longer matches the current halo, which would break the
     ownership-based cross-tile dedup that assumes each tile saw its full halo.
+
+    Each input is identified by its parent tile directory plus its basename:
+    every pipeline input is named ``raw.laz``, so the basename alone would
+    collapse a changed neighbour set of equal size into the same signature.
     """
     h = hashlib.sha256()
     h.update(region_path.read_bytes())
-    for name in sorted(p.name for p in inputs):
+    for name in sorted(f"{p.parent.name}/{p.name}" for p in inputs):
         h.update(b"\0")
         h.update(name.encode("utf-8"))
     return h.hexdigest()
@@ -97,10 +107,13 @@ def clip_tile(
             ["bash", str(script_path), str(region_path), str(output_path), *[str(p) for p in inputs]],
             check=True,
             capture_output=True,
+            timeout=_CLIP_TIMEOUT_S,
         )
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.decode(errors="ignore").strip()
         raise StageFailureError(f"[{tile_id}] Clipping failed: {stderr}") from e
+    except subprocess.TimeoutExpired as e:
+        raise StageFailureError(f"[{tile_id}] Clipping hung for {_CLIP_TIMEOUT_S}s and was killed") from e
 
     if not output_path.exists():
         raise StageFailureError(f"[{tile_id}] Clipping completed but file missing: {output_path}")

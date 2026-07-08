@@ -40,7 +40,7 @@ from src.stages import (  # noqa: E402
 def test_failed_statuses_empty_for_success_and_graceful_skips() -> None:
     # Successes and graceful skips ("not_in_coverage" = AHN6 coverage gap,
     # "empty_tile" = a tile with no trees) are not failures.
-    clean = ["ok", "downloaded", "complete", "chunk_done", "exists", "not_in_coverage", "empty_tile"]
+    clean = ["ok", "downloaded", "complete", "exists", "not_in_coverage", "empty_tile"]
     assert failed_statuses(clean) == []
     assert failed_statuses([]) == []
 
@@ -50,10 +50,11 @@ def test_failed_statuses_reports_genuine_failures() -> None:
     assert failed_statuses(statuses) == ["seg_failed", "download_failed"]
 
 
-def test_reconstruction_failure_statuses_are_classified() -> None:
-    # The reconstruction stage's own failure set must be a subset of the
-    # central classification, so a failed reconstruction exits non-zero.
-    assert {"failed", "stalled", "failed_max_attempts"} <= FAILURE_STATUSES
+def test_reconstruction_failure_status_is_classified() -> None:
+    # "failed" (an abandoned batch) is the reconstruction stage's only terminal
+    # failure status; it must be in the central classification so a failed
+    # reconstruction exits non-zero.
+    assert "failed" in FAILURE_STATUSES
 
 
 def test_run_stage_raises_on_nonzero_exit() -> None:

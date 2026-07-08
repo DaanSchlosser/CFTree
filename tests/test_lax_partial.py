@@ -13,10 +13,12 @@ buffer.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from shapely.geometry import box
 
 import src.get_data.lax_partial as lp
 from src.get_data.lax_partial import HttpRangeFile, LaxIndex, _merge_runs
+from src.stages import DownloadResult, RemoteUnavailableError
 
 
 def _index(cells: dict[int, list[int]]) -> LaxIndex:
@@ -88,9 +90,10 @@ class _FakeResp:
 class _FakeSession:
     """Serves byte ranges from an in-memory buffer and counts GET requests."""
 
-    def __init__(self, data: bytes):
+    def __init__(self, data: bytes, range_status: int = 206):
         self.data = data
         self.gets: list[tuple[int, int]] = []
+        self.range_status = range_status
 
     def head(self, url, timeout=None, allow_redirects=True):
         return _FakeResp(200, {"Content-Length": str(len(self.data))})
@@ -99,7 +102,8 @@ class _FakeSession:
         rng = headers["Range"].removeprefix("bytes=")
         start, end = (int(x) for x in rng.split("-"))
         self.gets.append((start, end))
-        return _FakeResp(200, content=self.data[start : end + 1])
+        body = self.data if self.range_status == 200 else self.data[start : end + 1]
+        return _FakeResp(self.range_status, content=body)
 
 
 def _make_file(data: bytes, monkeypatch, readahead=64, min_fetch=16):
@@ -145,3 +149,74 @@ def test_range_file_nonsequential_fetches_small(monkeypatch):
     f.read(4)  # a fresh seek: fetch only the small min block, not the big read-ahead
     start, end = f._session.gets[0]
     assert start == 500 and (end - start + 1) == 16
+
+
+def test_range_file_retries_transient_failures(monkeypatch):
+    # The first two range requests die mid-transfer; the third succeeds. The
+    # retry handler must actually catch these (naming an exception that does
+    # not exist at requests' top level used to turn every transient failure
+    # into an AttributeError and disable the retries entirely).
+    import requests
+
+    class _FlakySession(_FakeSession):
+        def __init__(self, data: bytes, failures: int):
+            super().__init__(data)
+            self.failures = failures
+
+        def get(self, url, headers=None, timeout=None, allow_redirects=True):
+            if self.failures > 0:
+                self.failures -= 1
+                raise requests.exceptions.ChunkedEncodingError("connection broken mid-body")
+            return super().get(url, headers=headers, timeout=timeout, allow_redirects=allow_redirects)
+
+    monkeypatch.setattr(lp, "_RETRY_BACKOFF_S", 0)
+    data = bytes(range(256)) * 8
+    f = HttpRangeFile("http://x/tile.laz", session=_FlakySession(data, failures=2))
+    f.seek(1000)
+    assert f.read(50) == data[1000:1050]
+
+
+def test_range_file_rejects_a_server_that_ignores_ranges(monkeypatch):
+    # A 200 answer to a Range request carries the whole file from byte 0;
+    # treating it as the requested slice would decode garbage points, so the
+    # reader must fail (read_region then falls back to the whole download).
+    data = bytes(range(256)) * 8
+    f = HttpRangeFile("http://x/tile.laz", session=_FakeSession(data, range_status=200))
+    f.seek(1000)
+    with pytest.raises(OSError, match="ignored range request"):
+        f.read(50)
+
+
+# ---------------------------------------------------------------------------
+# read_region: a missing .lax sidecar must not drop the tile from coverage
+# ---------------------------------------------------------------------------
+class _StubSource:
+    name = "AHN4"
+
+    def lax_url(self, tile_id):
+        return f"http://x/{tile_id}.LAX"
+
+    def laz_url(self, tile_id):
+        return f"http://x/{tile_id}.LAZ"
+
+
+def test_read_region_falls_back_to_whole_tile_when_lax_missing(tmp_path, monkeypatch):
+    # The GeoTiles LAZ exists but its .lax sidecar answers 404. Only the LAZ
+    # itself may classify a tile as out of coverage, so the read must fall back
+    # to the whole-tile download instead of raising RemoteUnavailableError
+    # (which the sweep records as a silent "not_in_coverage" skip).
+    def raise_unavailable(**kwargs):
+        raise RemoteUnavailableError("LAX HTTP 404 at http://x/t.LAX")
+
+    calls: dict[str, bool] = {}
+
+    def fake_download_tile(tile_id, output_dir, source, overwrite=False, cache_dir=None):
+        calls["whole_tile"] = True
+        return DownloadResult(laz=tmp_path / "raw.laz", lax=None, did_work=True)
+
+    monkeypatch.setattr(lp, "_ensure_cached", raise_unavailable)
+    monkeypatch.setattr(lp, "download_tile", fake_download_tile)
+
+    result = lp.read_region("37EN2_11", tmp_path, _StubSource(), box(0, 0, 10, 10))
+    assert calls.get("whole_tile") is True
+    assert result.did_work is True
