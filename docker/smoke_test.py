@@ -81,8 +81,16 @@ def check_drivers() -> None:
     result = subprocess.run(["pdal", "--drivers"], capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"pdal --drivers exited {result.returncode}: {result.stderr.strip()[:400]}")
-    for stage in ("readers.las", "readers.copc", "writers.las", "writers.gdal",
-                  "filters.merge", "filters.crop", "filters.range", "filters.csf"):
+    for stage in (
+        "readers.las",
+        "readers.copc",
+        "writers.las",
+        "writers.gdal",
+        "filters.merge",
+        "filters.crop",
+        "filters.range",
+        "filters.csf",
+    ):
         if stage not in result.stdout:
             raise RuntimeError(f"PDAL stage {stage} missing from this build")
 
@@ -129,6 +137,27 @@ def check_pipeline_help() -> None:
         raise RuntimeError(f"main.py --help exited {result.returncode}: {result.stderr.strip()[:400]}")
     if "CFTree" not in result.stdout:
         raise RuntimeError("main.py --help did not print the expected usage banner")
+
+
+def check_stage_entrypoints() -> None:
+    """Every stage module imports its full dependency chain and parses args.
+
+    main.py itself imports only src.config and src.stages and dispatches the
+    stages as subprocesses, so its --help proves nothing about the heavy stage
+    import chains (scipy submodules, rasterio.mask, the HOMED filter, the
+    CityJSON writer). Importing each stage here means an over-pruned runtime
+    environment fails this check rather than a colleague's first real run.
+    """
+    for module in ("scripts.get_data", "scripts.segmentation", "scripts.reconstruction"):
+        result = subprocess.run(
+            [sys.executable, "-m", module, "--help"],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"{module} --help exited {result.returncode}: {result.stderr.strip()[:400]}")
+    print("      stage entrypoints: get_data, segmentation, reconstruction all import and parse args")
 
 
 def _synthetic_tree(cx: float, cy: float, rng: np.random.Generator) -> np.ndarray:
@@ -213,6 +242,7 @@ CHECKS: tuple[tuple[str, Callable[[], None]], ...] = (
     ("conda env imports the geospatial stack", check_imports),
     ("pipeline drivers and backends are present", check_drivers),
     ("main.py --help runs under the entrypoint", check_pipeline_help),
+    ("stage entrypoints import their dependency chains", check_stage_entrypoints),
     ("segmentation binary runs on synthetic data", check_segmentation),
     ("alpha-wrap binary runs on synthetic data", check_alpha_wrap),
 )

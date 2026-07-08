@@ -69,7 +69,11 @@ RUN source /opt/conda/etc/profile.d/conda.sh && conda activate /opt/build-env \
     && cmake --build src/segmentation/TreeSeparation/build -j "$(nproc)" \
     && mkdir -p /out \
     && cp src/reconstruction/AlphaWrap/build/awrap_points /out/ \
-    && cp src/segmentation/TreeSeparation/build/segmentation /out/
+    && cp src/segmentation/TreeSeparation/build/segmentation /out/ \
+    # Release binaries still carry symbol tables; the conda compiler activation
+    # exports $STRIP for the matching binutils. The smoke test runs both
+    # binaries, so an over-strip cannot ship.
+    && "${STRIP:-strip}" /out/awrap_points /out/segmentation
 
 # ---------------------------------------------------------------------------
 # Stage 2: solve the runtime environment at its final absolute path, so no
@@ -78,6 +82,12 @@ RUN source /opt/conda/etc/profile.d/conda.sh && conda activate /opt/build-env \
 FROM condaforge/miniforge3:latest AS runtime-env
 
 SHELL ["/bin/bash", "-c"]
+
+# binutils provides `strip` for the shared-library pass below; it lives only
+# in this build stage, never in the shipped image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends binutils \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY docker/environment.runtime.yml /tmp/environment.runtime.yml
 RUN mamba env create -p /opt/env -f /tmp/environment.runtime.yml \
@@ -91,7 +101,25 @@ RUN mamba env create -p /opt/env -f /tmp/environment.runtime.yml \
     && find /opt/env/lib/python3.11/site-packages -type d \( -name tests -o -name test \) -prune -exec rm -rf {} + \
     && rm -rf /opt/env/include \
     && rm -rf /opt/env/share/man /opt/env/share/doc /opt/env/share/info \
-              /opt/env/share/locale /opt/env/share/gtk-doc /opt/env/share/terminfo
+              /opt/env/share/locale /opt/env/share/gtk-doc /opt/env/share/terminfo \
+    # conda-forge ships its shared libraries unstripped; their .symtab/.strtab
+    # and debug sections total ~90 MB across the env and serve only debuggers.
+    # --strip-unneeded keeps .dynsym, which is all dlopen and dynamic linking
+    # need. Non-ELF *.so* files make strip complain and skip them, hence the
+    # || true.
+    && { find /opt/env -type f -name '*.so*' -exec strip --strip-unneeded {} + 2>/dev/null || true; } \
+    # Packaging tools the image does not need. pip stays: the documented GPU
+    # derivation installs warp-lang with it, and installing a wheel needs
+    # neither setuptools nor wheel (the test stage's own pip install proves
+    # that on every build). docutils/m2r2/mistune are python-pdal's doc
+    # tooling, imported by nothing at runtime; etc/conda/test-files are conda
+    # package self-tests; cmake/pkgconfig metadata serves builds only.
+    && cd /opt/env/lib/python3.11/site-packages \
+    && rm -rf setuptools setuptools-* _distutils_hack distutils-precedence.pth pkg_resources \
+              wheel wheel-* docutils docutils-* m2r2* mistune* \
+    && rm -rf /opt/env/lib/python3.11/ensurepip \
+    && rm -f /opt/env/bin/wheel /opt/env/bin/rst2* /opt/env/bin/docutils /opt/env/bin/m2r2 \
+    && rm -rf /opt/env/etc/conda/test-files /opt/env/lib/cmake /opt/env/lib/pkgconfig
 
 # ---------------------------------------------------------------------------
 # Final stage: a slim base, the runtime environment, the source, the binaries.
